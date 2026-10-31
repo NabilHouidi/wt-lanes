@@ -1,0 +1,810 @@
+#!/usr/bin/env bash
+# wt — multi-repo worktree lanes for meta-project workspaces
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+wt — multi-repo worktree lanes for meta-project workspaces
+
+Usage:
+  wt [--force] create <feature> [repo...]   create a lane (all repos if none given)
+  wt [--force] cleanup <feature>            remove a lane's worktrees and branches
+  wt list (or ls)                           show lanes and per-repo status
+  wt path <feature>                         print a lane's directory
+  wt help                                   show this help
+
+--force: overwrite existing lane configuration/templates and allow cleanup to
+         remove generated scaffolding when other lane contents are present.
+         Can also be enabled with WT_FORCE=1.
+EOF
+}
+
+FORCE_REQUESTED=0
+case "${WT_FORCE:-}" in
+  1 | true | TRUE) FORCE_REQUESTED=1 ;;
+esac
+while [ "${1:-}" = "--force" ]; do
+  FORCE_REQUESTED=1
+  shift
+done
+
+# --- workspace discovery -----------------------------------------------------
+WORKSPACE_ROOT=""
+REPOS=()
+WT_DIR=""
+TMPL_DIR=""
+LANE_FEATURE_DIR=""
+LANE_MANIFEST_ENTRIES=()
+
+find_workspace_root() {
+  local dir="$PWD"
+  while [ "$dir" != "/" ]; do
+    if [ -f "$dir/.wt-workspace" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  echo "error: not inside a wt workspace (no .wt-workspace marker found)" >&2
+  return 1
+}
+
+init_workspace() {
+  WORKSPACE_ROOT=$(find_workspace_root) || return 1
+
+  # Optional per-workspace overrides, plain shell:
+  #   REPOS=(repoA repoB)             pin the repo list
+  #   DEFAULT_BASE=origin/master      base branch for new feature branches
+  # shellcheck disable=SC1091
+  if [ -s "$WORKSPACE_ROOT/.wt-workspace" ]; then
+    # shellcheck disable=SC1091
+    source "$WORKSPACE_ROOT/.wt-workspace"
+  fi
+  FORCE=$FORCE_REQUESTED
+
+  if [ -z "${REPOS+x}" ]; then
+    REPOS=()
+    local d
+    for d in "$WORKSPACE_ROOT"/*/; do
+      d=${d%/}
+      if is_repo_root "$d"; then
+        REPOS+=("$(basename "$d")")
+      fi
+    done
+  fi
+
+  WT_DIR="$WORKSPACE_ROOT/.worktrees"
+  local resolved
+  if resolved=$(realpath -m -- "$WT_DIR" 2>/dev/null); then
+    WT_DIR=$resolved
+  fi
+
+  TMPL_DIR="$WORKSPACE_ROOT/.wt-templates"
+}
+
+# --- path and worktree helpers ------------------------------------------------
+has_unsafe_path_component() {
+  local path="$1" part rest
+  while :; do
+    if [[ "$path" == */* ]]; then
+      part=${path%%/*}
+      rest=${path#*/}
+      case "$part" in
+        "" | "." | "..") return 0 ;;
+      esac
+      path=$rest
+    else
+      case "$path" in
+        "" | "." | "..") return 0 ;;
+      esac
+      return 1
+    fi
+  done
+}
+
+is_repo_name() {
+  local repo="$1"
+  case "$repo" in
+    "" | "." | ".." | -* | */*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+validate_repo_name() {
+  local repo="$1"
+  if ! is_repo_name "$repo"; then
+    echo "error: invalid repository name: '$repo'" >&2
+    return 1
+  fi
+}
+
+is_simple_filename() {
+  local name="$1"
+  case "$name" in
+    "" | "." | ".." | -* | */*) return 1 ;;
+  esac
+  if [[ "$name" == *$'\n'* ]]; then
+    return 1
+  fi
+}
+
+validate_feature_name() {
+  local feature="$1"
+  if [ -z "$feature" ] || [ "${feature:0:1}" = "/" ] || [ "${feature:0:1}" = "-" ]; then
+    echo "error: invalid feature name: '$feature'" >&2
+    return 1
+  fi
+  if has_unsafe_path_component "$feature"; then
+    echo "error: invalid feature name: '$feature'" >&2
+    return 1
+  fi
+  if ! git check-ref-format --branch "$feature" >/dev/null 2>&1; then
+    echo "error: invalid feature name: '$feature'" >&2
+    return 1
+  fi
+}
+
+lane_dir_for() {
+  local feature="$1"
+  validate_feature_name "$feature" || return 1
+
+  local dir="$WT_DIR/$feature"
+  local root candidate
+  if root=$(realpath -- "$WT_DIR" 2>/dev/null) &&
+    candidate=$(realpath -m -- "$dir" 2>/dev/null); then
+    case "$candidate" in
+      "$root")
+        echo "error: feature resolves to the worktree directory itself" >&2
+        return 1
+        ;;
+      "$root"/*) dir=$candidate ;;
+      *)
+        echo "error: feature resolves outside the worktree directory: '$feature'" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  printf '%s\n' "$dir"
+}
+
+worktree_belongs_to_main() {
+  local main="$1" target="$2"
+  git -C "$main" worktree list --porcelain 2>/dev/null |
+    grep -Fx "worktree $target" >/dev/null
+}
+
+is_feature_worktree() {
+  local main="$1" target="$2" feature="$3"
+  [ -f "$target/.git" ] || return 1
+  is_repo_root "$target" || return 1
+  [ "$(git -C "$target" branch --show-current 2>/dev/null)" = "$feature" ] || return 1
+  worktree_belongs_to_main "$main" "$target"
+}
+
+safe_include_path() {
+  local path="$1"
+  if [[ "$path" == ./* ]]; then
+    path=${path#./}
+  fi
+  if [ -z "$path" ] || [ "${path:0:1}" = "/" ]; then
+    return 1
+  fi
+  case "/$path/" in
+    */.git/*) return 1 ;;
+  esac
+  if has_unsafe_path_component "$path"; then
+    return 1
+  fi
+}
+
+is_repo_root() {
+  local dir="$1" cdup
+  [ -d "$dir" ] || return 1
+  cdup=$(git -C "$dir" rev-parse --show-cdup 2>/dev/null) || return 1
+  [ -z "$cdup" ]
+}
+
+base_branch_for() { # per-repo default branch, override with DEFAULT_BASE
+  local main="$1"
+  if [ -n "${DEFAULT_BASE:-}" ]; then
+    echo "$DEFAULT_BASE"
+    return
+  fi
+  local ref
+  ref=$(git -C "$main" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) ||
+    {
+      echo "origin/main"
+      return
+    }
+  echo "${ref#refs/remotes/}"
+}
+
+LANE_COLORS=(
+  "#2E5EAA" # blue
+  "#1E6F5C" # teal
+  "#B5451B" # burnt orange
+  "#6A4C93" # purple
+  "#A02334" # brick red
+  "#2C6E49" # forest green
+  "#8A5A00" # amber/brown
+  "#3D5A80" # slate blue
+  "#7A3E65" # plum
+  "#4C6444" # olive
+)
+
+lane_color() { # deterministic pick from LANE_COLORS, keyed by feature name
+  local input="$1" hash
+  if command -v md5sum >/dev/null 2>&1; then
+    hash=$(printf '%s' "$input" | md5sum | cut -c1-8)
+  elif command -v md5 >/dev/null 2>&1; then
+    hash=$(printf '%s' "$input" | md5 -q | cut -c1-8)
+  else
+    hash=$(printf '%08x' "$(printf '%s' "$input" | cksum | cut -d' ' -f1)")
+  fi
+  local idx=$((0x$hash % ${#LANE_COLORS[@]}))
+  echo "${LANE_COLORS[$idx]}"
+}
+
+generate_lane_guide() {
+  local feature="$1" feat_dir="$2"
+  shift 2
+  local guide
+  if [ -z "${LANE_GUIDE+x}" ]; then
+    guide="AGENTS.md" # agent-neutral default
+  else
+    guide="$LANE_GUIDE" # empty disables generation
+  fi
+  [ -n "$guide" ] || return 0
+
+  if ! is_simple_filename "$guide"; then
+    echo "error: invalid lane guide name: '$guide'" >&2
+    return 1
+  fi
+
+  local out="$feat_dir/$guide"
+  if [ "$FORCE" -eq 0 ] && [ -f "$out" ]; then
+    return 0 # don't clobber an existing lane guide
+  fi
+
+  append_lane_entry "$guide" || return 1
+  {
+    echo "# Feature: $feature"
+    echo
+    echo "## Repos in this lane"
+    for r in "$@"; do echo "- $r/"; done
+    echo
+    echo "## Rules"
+    echo "- Only edit files inside this directory"
+    echo "- Run tests in each repo before marking a task complete"
+    echo "- Follow each repository's documented setup and startup commands"
+  } >"$out"
+}
+
+generate_workspace_file() {
+  local feature="$1" feat_dir="$2"
+  local name
+  name=$(basename "$feature")
+  local color
+  color=$(lane_color "$feature")
+  local out="$feat_dir/$name.code-workspace"
+
+  if [ "$FORCE" -eq 0 ] && [ -e "$out" ]; then
+    return 0 # preserve user-customized workspace settings
+  fi
+
+  append_lane_entry "$name.code-workspace" || return 1
+
+  # One folder entry, the lane root itself: lane-level docs (AGENTS.md,
+  # HANDOVER.md, DESIGN.md, findings) are only reachable in the explorer if the
+  # root is a workspace folder. The repos appear as its subfolders. Listing the
+  # repos as folders *as well* would show every file twice in Quick Open.
+  {
+    echo '{'
+    echo '  "folders": ['
+    echo '    { "path": "." }'
+    echo '  ],'
+    echo '  "settings": {'
+    echo '    "workbench.colorCustomizations": {'
+    printf '      "titleBar.activeBackground": "%s",\n' "$color"
+    printf '      "titleBar.activeForeground": "#ffffff",\n'
+    printf '      "activityBar.background": "%s",\n' "$color"
+    printf '      "statusBar.background": "%s"\n' "$color"
+    echo '    }'
+    echo '  }'
+    echo '}'
+  } >"$out"
+}
+
+append_lane_entry() {
+  local name="$1" existing
+  if [ -z "$name" ] || [ "$name" = "." ] || [ "$name" = ".." ] ||
+    [[ "$name" == */* ]] || [[ "$name" == *$'\n'* ]]; then
+    return 1
+  fi
+  for existing in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
+    if [ "$existing" = "$name" ]; then
+      return 0
+    fi
+  done
+  LANE_MANIFEST_ENTRIES+=("$name")
+}
+
+load_lane_manifest() {
+  local lane_dir="$1"
+  local path="$lane_dir/.wt-lane-manifest"
+  local entry
+
+  LANE_FEATURE_DIR="$lane_dir"
+  LANE_MANIFEST_ENTRIES=()
+  if [ -f "$path" ]; then
+    while IFS= read -r entry || [ -n "$entry" ]; do
+      append_lane_entry "$entry" || true
+    done <"$path"
+  fi
+}
+
+write_lane_manifest() {
+  local path="$LANE_FEATURE_DIR/.wt-lane-manifest"
+  if [ ${#LANE_MANIFEST_ENTRIES[@]} -gt 0 ]; then
+    printf '%s\n' "${LANE_MANIFEST_ENTRIES[@]}" >"$path"
+  fi
+}
+
+is_lane_generated_entry() {
+  local name="$1" entry
+  for entry in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
+    if [ "$entry" = "$name" ]; then
+      return 0
+    fi
+  done
+
+  # Lanes created before the manifest existed still have a safe fallback set.
+  case "$name" in
+    *.code-workspace | AGENTS.md | .envrc | .wt-lane | .wt-lane-manifest | .idea | .run | .vscode)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# A file copied from a _lane template only counts as generated while it is
+# byte-identical to the template; once the user edits it, it is theirs.
+lane_entry_matches_template() {
+  local lane_dir="$1" name="$2"
+  local src="$TMPL_DIR/_lane/$name"
+  [ -f "$src" ] && [ -f "$lane_dir/$name" ] || return 0
+  cmp -s -- "$src" "$lane_dir/$name"
+}
+
+lane_has_non_generated_files() {
+  local lane_dir="$1" entry name
+  while IFS= read -r -d '' entry; do
+    name=${entry#"$lane_dir"/}
+    if ! is_lane_generated_entry "$name"; then
+      return 0
+    fi
+    if ! lane_entry_matches_template "$lane_dir" "$name"; then
+      return 0
+    fi
+  done < <(find "$lane_dir" -mindepth 1 -maxdepth 1 -print0)
+  return 1
+}
+
+remove_generated_lane_entries() {
+  local lane_dir="$1" entry name
+  while IFS= read -r -d '' entry; do
+    name=${entry#"$lane_dir"/}
+    if is_lane_generated_entry "$name" &&
+      lane_entry_matches_template "$lane_dir" "$name"; then
+      rm -rf -- "$entry"
+    fi
+  done < <(find "$lane_dir" -mindepth 1 -maxdepth 1 -print0)
+}
+
+apply_repo_scaffolding() {
+  local main="$1" target="$2" repo="$3" overwrite="$4"
+  local f source_path target_path
+
+  # 1. static scaffolding from templates (.run/, .vscode/, .envrc)
+  if [ -d "$TMPL_DIR/$repo" ]; then
+    if [ "$overwrite" -eq 1 ]; then
+      cp -r -- "$TMPL_DIR/$repo/." "$target/"
+    else
+      cp -rn -- "$TMPL_DIR/$repo/." "$target/"
+    fi
+  fi
+
+  # 2. live gitignored config from main checkout (wins over templates)
+  if [ -f "$main/.wt-include" ]; then
+    while IFS= read -r f || [ -n "$f" ]; do
+      if [ -z "$f" ]; then
+        continue
+      fi
+      if ! safe_include_path "$f"; then
+        echo "error: unsafe .wt-include path in $main: '$f'" >&2
+        return 1
+      fi
+
+      source_path="$main/$f"
+      target_path="$target/$f"
+      if [ ! -f "$source_path" ]; then
+        echo "error: .wt-include source not found: $source_path" >&2
+        return 1
+      fi
+
+      mkdir -p -- "$(dirname "$target_path")"
+      if [ "$overwrite" -eq 1 ]; then
+        cp -f -- "$source_path" "$target_path"
+      else
+        cp -n -- "$source_path" "$target_path"
+      fi
+    done <"$main/.wt-include"
+  fi
+
+  # 3. trust the envrc this script just placed
+  if [ -f "$target/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+    direnv allow "$target"
+  fi
+}
+
+# --- subcommands --------------------------------------------------------------
+cmd_create() {
+  local feature="${1:?usage: wt [--force] create <feature> [repo...]}"
+  shift
+  init_workspace || return 1
+
+  local repos=()
+  if [ "$#" -gt 0 ]; then
+    repos=("$@")
+  fi
+  if [ ${#repos[@]} -eq 0 ]; then
+    repos=("${REPOS[@]+"${REPOS[@]}"}")
+  fi
+
+  local feat_dir
+  feat_dir=$(lane_dir_for "$feature") || return 1
+
+  if [ -e "$feat_dir" ] && [ ! -d "$feat_dir" ]; then
+    echo "error: lane path is not a directory: $feat_dir" >&2
+    return 1
+  fi
+
+  if [ -f "$feat_dir/.wt-lane" ]; then
+    local stored
+    stored=$(cat "$feat_dir/.wt-lane" 2>/dev/null) || stored=""
+    if [ "$stored" != "$feature" ]; then
+      echo "error: existing lane at $feat_dir belongs to '$stored', not '$feature'" >&2
+      return 1
+    fi
+  fi
+
+  local created=()
+  for repo in "${repos[@]+"${repos[@]}"}"; do
+    validate_repo_name "$repo" || return 1
+
+    local main="$WORKSPACE_ROOT/$repo"
+    local target="$feat_dir/$repo"
+
+    if ! is_repo_root "$main"; then
+      echo "skip $repo (not a git repo)"
+      continue
+    fi
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      if is_feature_worktree "$main" "$target" "$feature"; then
+        local repair_overwrite=0
+        if [ "$FORCE" -eq 1 ]; then
+          repair_overwrite=1
+        fi
+        echo "repair $repo (worktree exists)"
+        apply_repo_scaffolding "$main" "$target" "$repo" "$repair_overwrite" || return 1
+        created+=("$repo")
+        continue
+      fi
+      echo "error: $target exists but is not a valid '$feature' worktree for $repo" >&2
+      return 1
+    fi
+
+    echo "==> $repo"
+    git -C "$main" fetch origin --quiet 2>/dev/null || true # tolerate missing origin/offline
+
+    if git -C "$main" show-ref --verify --quiet "refs/heads/$feature"; then
+      git -C "$main" worktree add "$target" "$feature"
+    else
+      local base
+      base=$(base_branch_for "$main")
+      git -C "$main" rev-parse --verify --quiet "$base" >/dev/null || base=HEAD
+      git -C "$main" worktree add "$target" -b "$feature" "$base"
+    fi
+
+    apply_repo_scaffolding "$main" "$target" "$repo" 1 || return 1
+
+    created+=("$repo")
+  done
+
+  if [ ${#created[@]} -eq 0 ]; then
+    echo "error: no worktrees created" >&2
+    return 1
+  fi
+
+  mkdir -p -- "$feat_dir"
+  load_lane_manifest "$feat_dir"
+
+  # lane-level scaffolding
+  if [ -d "$TMPL_DIR/_lane" ]; then
+    while IFS= read -r -d '' src; do
+      local template_name
+      template_name=$(basename "$src")
+      local template_dest="$feat_dir/$template_name"
+      if [ "$FORCE" -eq 1 ] || { [ ! -e "$template_dest" ] && [ ! -L "$template_dest" ]; }; then
+        append_lane_entry "$template_name" || return 1
+        cp -f -- "$src" "$template_dest"
+      else
+        cp -n -- "$src" "$template_dest"
+      fi
+    done < <(find "$TMPL_DIR/_lane" -maxdepth 1 -type f ! -name '*.tmpl' -print0)
+
+    while IFS= read -r -d '' src; do
+      local template_name
+      template_name=$(basename "$src")
+      local template_dest="$feat_dir/$template_name"
+      if [ "$FORCE" -eq 1 ] || { [ ! -e "$template_dest" ] && [ ! -L "$template_dest" ]; }; then
+        append_lane_entry "$template_name" || return 1
+        cp -r -- "$src" "$feat_dir/"
+      else
+        cp -rn -- "$src" "$feat_dir/"
+      fi
+    done < <(find "$TMPL_DIR/_lane" -mindepth 1 -maxdepth 1 -type d -print0)
+  fi
+  if [ -f "$feat_dir/.envrc" ] && command -v direnv >/dev/null 2>&1; then
+    direnv allow "$feat_dir"
+  fi
+
+  # IDE project name = product/workspace name (payments, search, …) instead of the
+  # lane folder; the branch widget already shows the lane. Skip if one exists.
+  if [ -d "$feat_dir/.idea" ] && [ ! -f "$feat_dir/.idea/.name" ]; then
+    basename "$WORKSPACE_ROOT" >"$feat_dir/.idea/.name"
+  fi
+
+  # lane marker: lets tools detect a lane root deterministically (walk up to the
+  # nearest .wt-lane). Durable scratch/work product belongs in the lane, not /tmp.
+  append_lane_entry ".wt-lane" || return 1
+  printf '%s\n' "$feature" >"$feat_dir/.wt-lane"
+
+  generate_lane_guide "$feature" "$feat_dir" "${created[@]+"${created[@]}"}"
+  generate_workspace_file "$feature" "$feat_dir"
+
+  append_lane_entry ".wt-lane-manifest" || return 1
+  write_lane_manifest
+
+  echo
+  local workspace_file
+  workspace_file="$feat_dir/$(basename "$feature").code-workspace"
+  echo "ready: $feat_dir"
+  echo "  workspace: $workspace_file"
+  if command -v code >/dev/null 2>&1; then
+    echo "  code \"$workspace_file\""
+  fi
+}
+
+cmd_cleanup() {
+  local feature="${1:?usage: wt [--force] cleanup <feature>}"
+  init_workspace || return 1
+
+  local feat_dir
+  feat_dir=$(lane_dir_for "$feature") || return 1
+
+  if [ ! -d "$feat_dir" ]; then
+    echo "error: no lane at $feat_dir" >&2
+    return 1
+  fi
+
+  if [ -f "$feat_dir/.wt-lane" ]; then
+    local stored
+    stored=$(cat "$feat_dir/.wt-lane" 2>/dev/null) || stored=""
+    if [ "$stored" != "$feature" ]; then
+      echo "error: lane at $feat_dir belongs to '$stored', not '$feature'" >&2
+      return 1
+    fi
+  fi
+
+  local discovered=()
+  while IFS= read -r -d '' gitfile; do
+    local repo_dir
+    repo_dir=$(dirname "$gitfile")
+    if [ "$(dirname "$repo_dir")" = "$feat_dir" ]; then
+      local repo
+      repo=$(basename "$repo_dir")
+      if is_repo_name "$repo"; then
+        discovered+=("$repo")
+      fi
+    fi
+  done < <(find "$feat_dir" -mindepth 2 -maxdepth 2 -name .git -type f -print0)
+
+  local failed=() dirty=()
+  if [ ${#discovered[@]} -gt 0 ]; then
+    for repo in "${discovered[@]+"${discovered[@]}"}"; do
+      local main="$WORKSPACE_ROOT/$repo"
+      local target="$feat_dir/$repo"
+
+      if ! is_repo_root "$main"; then
+        echo "error: main repository not found at $main" >&2
+        failed+=("$repo")
+        continue
+      fi
+
+      if ! is_repo_root "$target"; then
+        echo "error: lane path is not a valid repository: $target" >&2
+        failed+=("$repo")
+        continue
+      fi
+
+      if ! worktree_belongs_to_main "$main" "$target"; then
+        echo "error: lane path is not linked to $main: $target" >&2
+        failed+=("$repo")
+        continue
+      fi
+
+      local status
+      status=$(git -C "$target" status --porcelain 2>/dev/null) || {
+        echo "error: cannot inspect lane worktree: $target" >&2
+        failed+=("$repo")
+        continue
+      }
+
+      if [ -n "$status" ]; then
+        dirty+=("$repo")
+      fi
+    done
+  fi
+
+  if [ ${#failed[@]} -gt 0 ]; then
+    echo "error: cleanup preflight failed; no worktrees were removed" >&2
+    return 1
+  fi
+
+  if [ ${#dirty[@]} -gt 0 ]; then
+    echo "error: lane worktrees contain uncommitted changes; no worktrees were removed" >&2
+    for repo in "${dirty[@]+"${dirty[@]}"}"; do
+      echo "  $repo" >&2
+    done
+    return 1
+  fi
+
+  if [ ${#discovered[@]} -gt 0 ]; then
+    for repo in "${discovered[@]+"${discovered[@]}"}"; do
+      local main="$WORKSPACE_ROOT/$repo"
+      local target="$feat_dir/$repo"
+
+      echo "==> $repo"
+      if git -C "$main" worktree remove "$target" &&
+        git -C "$main" worktree prune; then
+        git -C "$main" branch -d "$feature" 2>/dev/null ||
+          echo "    branch $feature kept (unmerged or absent)"
+      else
+        echo "    remove failed (dirty or invalid worktree)" >&2
+        failed+=("$repo")
+      fi
+    done
+  fi
+
+  if [ ${#failed[@]} -gt 0 ]; then
+    echo "error: cleanup incomplete; lane left in place" >&2
+    return 1
+  fi
+
+  load_lane_manifest "$feat_dir"
+  if lane_has_non_generated_files "$feat_dir" && [ "$FORCE" -eq 0 ]; then
+    echo "note: lane contains non-generated files; leaving lane files in place" >&2
+    return 0
+  fi
+
+  remove_generated_lane_entries "$feat_dir"
+
+  # remove lane dir and any now-empty parents up to .worktrees
+  if rmdir -- "$feat_dir" 2>/dev/null; then
+    local parent
+    parent=$(dirname "$feat_dir")
+    while [ "$parent" != "$WT_DIR" ]; do
+      if rmdir -- "$parent" 2>/dev/null; then
+        parent=$(dirname "$parent")
+      else
+        break
+      fi
+    done
+  else
+    echo "note: $feat_dir not empty, left in place"
+  fi
+}
+
+cmd_list() {
+  init_workspace || return 1
+
+  if [ ! -d "$WT_DIR" ]; then
+    echo "no lanes"
+    return 0
+  fi
+
+  local found=0
+  while IFS= read -r -d '' marker; do
+    local lane_dir
+    lane_dir=$(dirname "$marker")
+    local actual="${lane_dir#"$WT_DIR"/}"
+    local stored
+    stored=$(cat "$marker" 2>/dev/null) || continue
+    if [ "$stored" != "$actual" ] || ! validate_feature_name "$stored" >/dev/null 2>&1; then
+      continue
+    fi
+
+    while IFS= read -r -d '' gitfile; do
+      local repo_dir
+      repo_dir=$(dirname "$gitfile")
+      if [ "$(dirname "$repo_dir")" != "$lane_dir" ]; then
+        continue
+      fi
+
+      local repo
+      repo=$(basename "$repo_dir")
+      if ! is_repo_name "$repo"; then
+        continue
+      fi
+
+      found=1
+      local branch dirty ahead_behind
+      branch=$(git -C "$repo_dir" branch --show-current)
+      dirty=$(git -C "$repo_dir" status --porcelain | wc -l)
+      ahead_behind=$(git -C "$repo_dir" rev-list --left-right --count \
+        "origin/$branch...HEAD" 2>/dev/null | awk '{print "-"$1" +"$2}') || ahead_behind="?"
+      printf '%-30s %-15s %-25s %3s dirty  %s\n' \
+        "$stored" "$repo" "$branch" "$dirty" "$ahead_behind"
+    done < <(find "$lane_dir" -mindepth 2 -maxdepth 2 -name .git -type f -print0)
+  done < <(find "$WT_DIR" -mindepth 2 -type f -name .wt-lane -print0)
+
+  if [ "$found" -eq 0 ]; then
+    echo "no lanes"
+  fi
+}
+
+cmd_path() {
+  local feature="${1:?usage: wt path <feature>}"
+  init_workspace || return 1
+
+  local feat_dir
+  feat_dir=$(lane_dir_for "$feature") || return 1
+  if [ ! -d "$feat_dir" ]; then
+    echo "error: no lane at $feat_dir" >&2
+    return 1
+  fi
+  echo "$feat_dir"
+}
+
+# --- dispatch ------------------------------------------------------------------
+case "${1:-}" in
+  create)
+    shift
+    cmd_create "$@"
+    ;;
+  cleanup)
+    shift
+    cmd_cleanup "$@"
+    ;;
+  list | ls)
+    shift
+    cmd_list "$@"
+    ;;
+  path)
+    shift
+    cmd_path "$@"
+    ;;
+  help | -h | --help)
+    shift
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

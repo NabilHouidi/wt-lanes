@@ -1,0 +1,6 @@
+.worktrees/
+.wt-workspace
+.DS_Store
+
+# keep the example workspace marker tracked
+!examples/**/.wt-workspace
