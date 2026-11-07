@@ -11,8 +11,30 @@ examples/quickstart.sh
 ```
 
 The script creates three scratch repositories in a temp directory, applies the
-example configuration, and runs `wt create` and `wt list`. The directory is left
-behind so you can inspect the lane and run `wt cleanup` yourself.
+example configuration, and creates three lanes with hierarchical names. The
+directory is left behind so you can inspect the lanes and run `wt cleanup`
+yourself.
+
+## What the demo creates
+
+Lane names double as branch names, so hierarchy works — related lanes group
+under `.worktrees/<prefix>/`, and each lane can cover a different subset of
+repositories:
+
+```text
+.worktrees/
+├── feat/
+│   └── gift-card-checkout/       # all three repositories
+├── hotfix/
+│   └── 1.2.4-double-charge/      # checkout-api only
+└── review/
+    └── pr-1234/                  # checkout-web + shared-events
+```
+
+Each leaf is a full lane: repository worktrees on a branch matching the lane
+name, a generated `AGENTS.md` and `<name>.code-workspace`, and any `_lane`
+template files. `wt list` prints the full lane names, and `wt cleanup` prunes
+empty parent directories, so `.worktrees/feat/` disappears with its last lane.
 
 ## Layout
 

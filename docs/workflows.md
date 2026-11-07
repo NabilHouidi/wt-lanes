@@ -4,6 +4,7 @@ Practical patterns for using `wt` day to day. Each recipe assumes you are inside
 a workspace (a directory containing `.wt-workspace`).
 
 - [Develop a cross-repository feature](#develop-a-cross-repository-feature)
+- [Name lanes like branches](#name-lanes-like-branches)
 - [Review a pull request in isolation](#review-a-pull-request-in-isolation)
 - [Hotfix against a release branch](#hotfix-against-a-release-branch)
 - [Run AI coding agents in parallel lanes](#run-ai-coding-agents-in-parallel-lanes)
@@ -36,6 +37,41 @@ wt cleanup gift-card-checkout
 If you kept notes in the lane root (for example `HANDOVER.md`), cleanup reports
 them as non-generated and leaves the lane files in place. Remove them yourself
 when you no longer need them.
+
+## Name lanes like branches
+
+A lane name doubles as the Git branch created in every repository, so the
+branch naming conventions you already use work — including hierarchy:
+
+```bash
+wt create feat/gift-card-checkout
+wt create hotfix/1.2.4-double-charge checkout-api
+wt create review/pr-1234 checkout-web shared-events
+```
+
+`.worktrees/` mirrors the hierarchy, so related lanes group together and each
+lane can cover a different subset of repositories:
+
+```text
+.worktrees/
+├── feat/
+│   └── gift-card-checkout/       # worktrees for every repo + lane files
+├── hotfix/
+│   └── 1.2.4-double-charge/      # checkout-api only
+└── review/
+    └── pr-1234/                  # checkout-web + shared-events
+```
+
+Useful prefixes: `feat/`, `fix/`, `hotfix/<version>-<what>`, `review/pr-<n>`,
+`agent/<task>`, `<team>/<initiative>`.
+
+Details worth knowing:
+
+- The generated VS Code workspace file uses the last component:
+  `.worktrees/feat/gift-card-checkout/gift-card-checkout.code-workspace`.
+- `wt list` prints the full lane name, for example `feat/gift-card-checkout`.
+- `wt cleanup` removes now-empty parent directories, so `.worktrees/feat/`
+  disappears together with its last lane.
 
 ## Review a pull request in isolation
 
