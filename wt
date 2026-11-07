@@ -37,6 +37,7 @@ TMPL_DIR=""
 LANE_FEATURE_DIR=""
 LANE_MANIFEST_ENTRIES=()
 
+# walk up from $PWD to the nearest .wt-workspace marker
 find_workspace_root() {
   local dir="$PWD"
   while [ "$dir" != "/" ]; do
@@ -50,6 +51,7 @@ find_workspace_root() {
   return 1
 }
 
+# locate the workspace, source its config, resolve derived paths
 init_workspace() {
   WORKSPACE_ROOT=$(find_workspace_root) || return 1
 
@@ -63,6 +65,7 @@ init_workspace() {
   fi
   FORCE=$FORCE_REQUESTED
 
+  # REPOS unset: auto-discover child directories that are repository roots
   if [ -z "${REPOS+x}" ]; then
     REPOS=()
     local d
@@ -84,6 +87,7 @@ init_workspace() {
 }
 
 # --- path and worktree helpers ------------------------------------------------
+# true when any /-separated component is empty, . or ..
 has_unsafe_path_component() {
   local path="$1" part rest
   while :; do
@@ -103,6 +107,7 @@ has_unsafe_path_component() {
   done
 }
 
+# simple directory name: no slashes, no . .. or leading dash
 is_repo_name() {
   local repo="$1"
   case "$repo" in
@@ -111,6 +116,7 @@ is_repo_name() {
   esac
 }
 
+# is_repo_name, with an error message
 validate_repo_name() {
   local repo="$1"
   if ! is_repo_name "$repo"; then
@@ -119,6 +125,7 @@ validate_repo_name() {
   fi
 }
 
+# is_repo_name plus a newline rejection (for LANE_GUIDE)
 is_simple_filename() {
   local name="$1"
   case "$name" in
@@ -129,6 +136,7 @@ is_simple_filename() {
   fi
 }
 
+# feature must be a safe relative path and valid branch name
 validate_feature_name() {
   local feature="$1"
   if [ -z "$feature" ] || [ "${feature:0:1}" = "/" ] || [ "${feature:0:1}" = "-" ]; then
@@ -145,12 +153,14 @@ validate_feature_name() {
   fi
 }
 
+# print the lane dir, refusing anything that escapes .worktrees
 lane_dir_for() {
   local feature="$1"
   validate_feature_name "$feature" || return 1
 
   local dir="$WT_DIR/$feature"
   local root candidate
+  # canonicalize when realpath is available; otherwise trust the validated name
   if root=$(realpath -- "$WT_DIR" 2>/dev/null) &&
     candidate=$(realpath -m -- "$dir" 2>/dev/null); then
     case "$candidate" in
@@ -169,12 +179,14 @@ lane_dir_for() {
   printf '%s\n' "$dir"
 }
 
+# true if target is registered in main's worktree list
 worktree_belongs_to_main() {
   local main="$1" target="$2"
   git -C "$main" worktree list --porcelain 2>/dev/null |
     grep -Fx "worktree $target" >/dev/null
 }
 
+# linked worktree of main, currently on branch <feature>
 is_feature_worktree() {
   local main="$1" target="$2" feature="$3"
   [ -f "$target/.git" ] || return 1
@@ -183,6 +195,7 @@ is_feature_worktree() {
   worktree_belongs_to_main "$main" "$target"
 }
 
+# .wt-include entry: relative, no traversal, never under .git
 safe_include_path() {
   local path="$1"
   if [[ "$path" == ./* ]]; then
@@ -199,6 +212,7 @@ safe_include_path() {
   fi
 }
 
+# true if dir is a git worktree top level (empty --show-cdup)
 is_repo_root() {
   local dir="$1" cdup
   [ -d "$dir" ] || return 1
@@ -206,7 +220,8 @@ is_repo_root() {
   [ -z "$cdup" ]
 }
 
-base_branch_for() { # per-repo default branch, override with DEFAULT_BASE
+# per-repo default branch, override with DEFAULT_BASE
+base_branch_for() {
   local main="$1"
   if [ -n "${DEFAULT_BASE:-}" ]; then
     echo "$DEFAULT_BASE"
@@ -234,7 +249,8 @@ LANE_COLORS=(
   "#4C6444" # olive
 )
 
-lane_color() { # deterministic pick from LANE_COLORS, keyed by feature name
+# deterministic pick from LANE_COLORS, keyed by feature name
+lane_color() {
   local input="$1" hash
   if command -v md5sum >/dev/null 2>&1; then
     hash=$(printf '%s' "$input" | md5sum | cut -c1-8)
@@ -247,6 +263,7 @@ lane_color() { # deterministic pick from LANE_COLORS, keyed by feature name
   echo "${LANE_COLORS[$idx]}"
 }
 
+# write the lane guide (AGENTS.md or $LANE_GUIDE)
 generate_lane_guide() {
   local feature="$1" feat_dir="$2"
   shift 2
@@ -282,6 +299,7 @@ generate_lane_guide() {
   } >"$out"
 }
 
+# write the lane's <name>.code-workspace with its lane color
 generate_workspace_file() {
   local feature="$1" feat_dir="$2"
   local name
@@ -317,12 +335,14 @@ generate_workspace_file() {
   } >"$out"
 }
 
+# record a top-level lane entry as wt-generated (deduped)
 append_lane_entry() {
   local name="$1" existing
   if [ -z "$name" ] || [ "$name" = "." ] || [ "$name" = ".." ] ||
     [[ "$name" == */* ]] || [[ "$name" == *$'\n'* ]]; then
     return 1
   fi
+  # the [@]+"${...[@]}" form expands an empty array safely under set -u
   for existing in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
     if [ "$existing" = "$name" ]; then
       return 0
@@ -331,6 +351,7 @@ append_lane_entry() {
   LANE_MANIFEST_ENTRIES+=("$name")
 }
 
+# read a lane's manifest into LANE_MANIFEST_ENTRIES
 load_lane_manifest() {
   local lane_dir="$1"
   local path="$lane_dir/.wt-lane-manifest"
@@ -345,6 +366,7 @@ load_lane_manifest() {
   fi
 }
 
+# write LANE_MANIFEST_ENTRIES to the lane's manifest file
 write_lane_manifest() {
   local path="$LANE_FEATURE_DIR/.wt-lane-manifest"
   if [ ${#LANE_MANIFEST_ENTRIES[@]} -gt 0 ]; then
@@ -352,6 +374,7 @@ write_lane_manifest() {
   fi
 }
 
+# true if name is a known wt-generated lane entry
 is_lane_generated_entry() {
   local name="$1" entry
   for entry in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
@@ -378,6 +401,7 @@ lane_entry_matches_template() {
   cmp -s -- "$src" "$lane_dir/$name"
 }
 
+# true if any top-level lane entry is user content
 lane_has_non_generated_files() {
   local lane_dir="$1" entry name
   while IFS= read -r -d '' entry; do
@@ -392,6 +416,7 @@ lane_has_non_generated_files() {
   return 1
 }
 
+# delete only entries known to be wt-generated
 remove_generated_lane_entries() {
   local lane_dir="$1" entry name
   while IFS= read -r -d '' entry; do
@@ -403,6 +428,7 @@ remove_generated_lane_entries() {
   done < <(find "$lane_dir" -mindepth 1 -maxdepth 1 -print0)
 }
 
+# templates, then live .wt-include copies, then direnv
 apply_repo_scaffolding() {
   local main="$1" target="$2" repo="$3" overwrite="$4"
   local f source_path target_path
@@ -450,6 +476,7 @@ apply_repo_scaffolding() {
 }
 
 # --- subcommands --------------------------------------------------------------
+# create or repair a lane: worktrees, scaffolding, guide, workspace
 cmd_create() {
   local feature="${1:?usage: wt [--force] create <feature> [repo...]}"
   shift
@@ -493,6 +520,7 @@ cmd_create() {
     fi
 
     if [ -e "$target" ] || [ -L "$target" ]; then
+      # valid existing worktree: repair scaffolding (overwrite only with --force)
       if is_feature_worktree "$main" "$target" "$feature"; then
         local repair_overwrite=0
         if [ "$FORCE" -eq 1 ]; then
@@ -510,6 +538,7 @@ cmd_create() {
     echo "==> $repo"
     git -C "$main" fetch origin --quiet 2>/dev/null || true # tolerate missing origin/offline
 
+    # attach an existing local branch (review/hotfix flows); else branch from base
     if git -C "$main" show-ref --verify --quiet "refs/heads/$feature"; then
       git -C "$main" worktree add "$target" "$feature"
     else
@@ -589,6 +618,7 @@ cmd_create() {
   fi
 }
 
+# remove a lane's worktrees and branches, then generated lane files
 cmd_cleanup() {
   local feature="${1:?usage: wt [--force] cleanup <feature>}"
   init_workspace || return 1
@@ -610,6 +640,7 @@ cmd_cleanup() {
     fi
   fi
 
+  # discover repos from the lane itself, not the current REPOS config
   local discovered=()
   while IFS= read -r -d '' gitfile; do
     local repo_dir
@@ -623,6 +654,7 @@ cmd_cleanup() {
     fi
   done < <(find "$feat_dir" -mindepth 2 -maxdepth 2 -name .git -type f -print0)
 
+  # preflight: verify linkage and cleanliness before removing anything
   local failed=() dirty=()
   if [ ${#discovered[@]} -gt 0 ]; then
     for repo in "${discovered[@]+"${discovered[@]}"}"; do
@@ -719,6 +751,7 @@ cmd_cleanup() {
   fi
 }
 
+# print every lane's repos with branch, dirty count, origin delta
 cmd_list() {
   init_workspace || return 1
 
@@ -727,6 +760,7 @@ cmd_list() {
     return 0
   fi
 
+  # lanes are found by their .wt-lane marker, at any nesting depth
   local found=0
   while IFS= read -r -d '' marker; do
     local lane_dir
@@ -767,6 +801,7 @@ cmd_list() {
   fi
 }
 
+# print a lane's directory (for cd "$(wt path ...)")
 cmd_path() {
   local feature="${1:?usage: wt path <feature>}"
   init_workspace || return 1
