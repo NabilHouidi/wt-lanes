@@ -147,7 +147,7 @@ config/local.yaml
 ```
 
 Details and rules are in the README under
-[Live ignored configuration](../README.md#live-ignored-configuration). Keep it
+[Live ignored configuration](templates.md#live-ignored-configuration). Keep it
 to local developer settings — never commit credentials to satisfy this file.
 
 ## Adopt `wt` gradually in an existing workspace
