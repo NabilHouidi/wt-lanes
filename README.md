@@ -12,7 +12,6 @@ A **lane** is a feature-scoped directory that contains linked Git worktrees from
 - [Quick start](#quick-start)
 - [Workspace layout](#workspace-layout)
 - [Commands](#commands)
-- [Global options](#global-options)
 - [Safety](#safety)
 - [Documentation](#documentation)
 - [Development](#development)
@@ -27,11 +26,9 @@ It provides:
 - One directory per feature.
 - Linked Git worktrees for each selected repository.
 - Automatic branch naming based on the feature.
-- Optional per-repository and lane-level IDE templates.
-- Optional copying of Git-ignored local configuration.
+- Optional per-repository and lane-level templates: IDE settings, `.envrc`, a lane guide for AI coding agents or human handoff.
 - Generated VS Code workspaces with deterministic lane colors.
-- A generated lane guide for AI coding agents or human handoff.
-- Lane-aware cleanup that preserves content it did not generate.
+- Cleanup that removes the lane's worktrees, merged branches and every file `wt` placed — after listing any uncommitted or edited work it would delete and asking first.
 - Protection against paths that resolve outside the workspace.
 
 ## Installation
@@ -77,15 +74,15 @@ Optional:
 
 ### Workspace root
 
-`wt` walks upward from the current directory until it finds a `.wt-workspace` marker.
+`wt` walks upward from the current directory until it finds a `.wt/workspace.sh` marker.
 
 Create one in your meta-project directory:
 
 ```bash
-touch .wt-workspace
+mkdir -p .wt && touch .wt/workspace.sh
 ```
 
-The marker file may be empty.
+The file may be empty; it doubles as the workspace's configuration (see [Configuration](docs/configuration.md)).
 
 ## Quick start
 
@@ -102,16 +99,22 @@ A new “gift card checkout” feature requires changes in all three. Rather tha
 
 ```bash
 cd commerce-workspace
-touch .wt-workspace
+mkdir -p .wt && touch .wt/workspace.sh
 wt create gift-card-checkout
 ```
 
-Expected output:
+Expected output (Git's own lines shortened to the first repository):
 
 ```text
 ==> checkout-api
+Preparing worktree (new branch 'gift-card-checkout')
+branch 'gift-card-checkout' set up to track 'origin/main'.
+HEAD is now at ce7ff1b init
 ==> checkout-web
+…
 ==> shared-events
+…
+note: no .wt/lane_root/ or .wt/repos/ in /home/you/commerce-workspace; lane has no scaffolding
 
 ready: /home/you/commerce-workspace/.worktrees/gift-card-checkout
   workspace: /home/you/commerce-workspace/.worktrees/gift-card-checkout/gift-card-checkout.code-workspace
@@ -124,14 +127,13 @@ The original checkouts remain untouched:
 commerce-workspace/
 ├── .worktrees/
 │   └── gift-card-checkout/
-│       ├── AGENTS.md
 │       ├── .wt-lane
-│       ├── .wt-lane-manifest
 │       ├── checkout-api/
 │       ├── checkout-web/
 │       ├── gift-card-checkout.code-workspace
 │       └── shared-events/
-├── .wt-workspace
+├── .wt/
+│   └── workspace.sh
 ├── checkout-api/
 ├── checkout-web/
 └── shared-events/
@@ -167,9 +169,11 @@ gift-card-checkout               checkout-web        gift-card-checkout         
 gift-card-checkout               shared-events       gift-card-checkout         0 dirty  ?
 ```
 
+The last column is `-behind +ahead` relative to `origin/<branch>`, or `?` when that branch has not been pushed.
+
 Commit, push, and create PRs normally inside each repository lane. `wt` does not create commits for you.
 
-When the work is merged, remove the lane. `wt` first checks every lane worktree; if one has staged, modified, or nonignored untracked files, cleanup stops before removing anything. Once the repositories are clean:
+When the work is merged, remove the lane:
 
 ```bash
 wt cleanup gift-card-checkout
@@ -179,15 +183,30 @@ Example output:
 
 ```text
 ==> checkout-api
+Deleted branch gift-card-checkout (was ce7ff1b).
 ==> checkout-web
     branch gift-card-checkout kept (unmerged or absent)
 ==> shared-events
+Deleted branch gift-card-checkout (was 38bb5a8).
 ```
 
-If you leave notes such as `gift-card-checkout/HANDOVER.md` in the lane root, cleanup also reports that they are not generated and leaves them in place:
+Cleanup removes the worktrees, every branch that is merged, and everything `wt` placed in the lane root: template copies, the `.code-workspace` file, `.idea/`. If that would delete work that exists nowhere else — uncommitted changes in a worktree, or a template copy someone edited — it lists it and asks first:
 
 ```text
-note: lane contains non-generated files; leaving lane files in place
+warning: cleanup would delete work that exists nowhere else:
+  checkout-api/main.go (uncommitted)
+  HANDOVER.md (edited template copy)
+Delete it anyway? [y/N]
+```
+
+Without a terminal to answer (a script, an agent), it stops and removes nothing.
+
+Files `wt` did not place, such as a `.tmp/` directory of notes, stay in the lane root and are listed:
+
+```text
+note: worktrees removed; kept lane files that wt did not create:
+  .tmp
+  when done with them: rm -rf "/home/you/commerce-workspace/.worktrees/gift-card-checkout"
 ```
 
 ## Workspace layout
@@ -196,27 +215,22 @@ The recommended layout is:
 
 ```text
 commerce-workspace/
-├── .wt-workspace
-├── wt
+├── .wt/
+│   ├── workspace.sh          # marks the workspace root; sourced shell config
+│   ├── lane_root/            # copied into the root of every lane
+│   ├── repos/
+│   │   ├── checkout-api/     # copied into every checkout-api worktree
+│   │   └── checkout-web/
+│   └── README.md             # optional notes; ignored by wt
 ├── checkout-api/
 ├── checkout-web/
 ├── shared-events/
-├── .worktrees/
-└── .wt-templates/
-    ├── _lane/
-    ├── checkout-api/
-    └── checkout-web/
+└── .worktrees/               # lanes, created by wt
 ```
 
-Only the marker, main repositories, and optional template directories are required. `.worktrees/` is created automatically.
+Only `.wt/workspace.sh` and the main repositories are required. Workspaces that still use `.wt-workspace` and `.wt-templates/` get an error from `wt` with the commands to migrate; see [Configuration](docs/configuration.md#layout).
 
 ## Commands
-
-Global options must appear before the command:
-
-```bash
-wt [global-options] <command> [arguments]
-```
 
 ### `wt create`
 
@@ -240,7 +254,9 @@ wt create team/gift-card-checkout
 
 The feature name is used as the branch name in each selected repository.
 
-Rerunning `create` on an existing lane repairs missing repository and lane scaffolding. Files already present in the lane are preserved unless `--force` is used.
+New branches start from `DEFAULT_BASE` or the repository's `origin/HEAD`. If `origin` cannot be fetched, or that base does not exist, `wt` prints a warning — in the second case it branches from the main checkout's current `HEAD`.
+
+Rerunning `create` on an existing lane restores missing repository and lane scaffolding. It never overwrites a file already in the lane; to pick up a changed template, delete the lane's copy and rerun.
 
 `wt` does not stage, commit, push, merge, or delete commits.
 
@@ -276,11 +292,13 @@ cd "$(wt path gift-card-checkout)/checkout-api"
 
 ### `wt cleanup`
 
-Remove lane worktrees and attempt safe branch cleanup:
+Remove lane worktrees, merged branches, and the files `wt` placed in the lane:
 
 ```bash
 wt cleanup <feature>
 ```
+
+Uncommitted changes, edited or added files in template copies, and shelved IDE changes are listed first and need a `y` to be deleted. `.idea/` (IDE state) is deleted with the lane. Other files `wt` did not place stay and are listed, with an `rm -rf` line for the lane. A directory without a `.wt-lane` marker is refused.
 
 ### `wt help`
 
@@ -288,43 +306,26 @@ wt cleanup <feature>
 wt help
 ```
 
-## Global options
-
-### `--force`
-
-```bash
-wt --force create <feature>
-wt --force cleanup <feature>
-```
-
-For `create`, allow lane templates and generated files to overwrite existing entries.
-
-For `cleanup`, remove recognized generated lane entries even when the lane also contains unrecognized files. Unrecognized files are still not deleted.
-
-The flag must precede the subcommand.
-
-You can also use:
-
-```bash
-WT_FORCE=1 wt create gift-card-checkout
-```
-
 ## Safety
 
-`wt` is designed to never destroy your work:
+`wt` is designed not to destroy your work:
 
 - Feature names are validated as Git branch names; lane paths resolving outside `.worktrees` are refused.
-- Existing files are never overwritten without `--force`.
-- Cleanup checks every lane worktree for uncommitted changes *before* removing anything, and deletes branches with `git branch -d` — never a force delete.
-- Lane files `wt` did not generate are preserved, including template files you have since edited.
+- Files already in a lane are never overwritten.
+- A lane is never created inside or around another lane, and cleanup refuses a directory without a `.wt-lane` marker.
+- Before removing anything, cleanup lists uncommitted changes, edited or added files in template copies, and shelved IDE changes it would delete, and asks for confirmation; without a terminal it stops.
+- Branches are deleted with `git branch -d` — never a force delete — so unmerged commits survive cleanup.
+- Files in the lane root that `wt` did not place are never deleted, apart from the IDE state in `.idea/`.
+
+One gap: Git-ignored files inside a worktree that did not come from a template (a local `.env`, build output) are deleted with the worktree without a warning. Copy out anything you need before cleanup.
 
 It never runs `git clean`, `git reset`, `git rebase`, `git commit`, or `git push`. See [Safety and cleanup](docs/safety-and-cleanup.md) for the full list.
 
 ## Documentation
 
 - [Workflows and recipes](docs/workflows.md) — everyday patterns: lane naming, feature lanes, PR review, hotfixes, AI agent lanes, and adoption tips.
-- [Configuration](docs/configuration.md) — `.wt-workspace` settings: `REPOS`, `DEFAULT_BASE`, `LANE_GUIDE`, and repository discovery rules.
-- [Customizing lanes](docs/templates.md) — templates, `.wt-include` live configuration, generated lane files, and IDE setup.
+- [Configuration](docs/configuration.md) — `.wt/workspace.sh` settings: `REPOS`, `DEFAULT_BASE`, and repository discovery rules.
+- [Customizing lanes](docs/templates.md) — templates, the lane guide, generated lane files, and IDE setup.
 - [Safety and cleanup](docs/safety-and-cleanup.md) — exactly what `wt` will and will not do, plus security notes.
 - [Troubleshooting](docs/troubleshooting.md) — common errors and fixes.
 - [`examples/`](examples/) — a copyable example workspace and a demo script that builds a scratch workspace so you can try `wt` safely.
@@ -342,6 +343,14 @@ If ShellCheck is available:
 ```bash
 shellcheck wt
 ```
+
+Run the end-to-end tests (each builds throwaway workspaces under `$TMPDIR` and removes them; exits non-zero on any failure):
+
+```bash
+tests/run.sh
+```
+
+The confirmation-prompt checks need util-linux `script` and are skipped without it (for example on macOS).
 
 The implementation is intentionally kept as a single Bash script for simple installation.
 

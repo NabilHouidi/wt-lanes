@@ -16,14 +16,14 @@ What `wt` will and will not do to your repositories and files.
 - refuses lane names resolving outside `.worktrees`
 - restricts repository names to simple directory names
 - requires repository paths to be actual repository roots
-- rejects unsafe `.git`, absolute, missing, and traversal `.wt-include` paths loudly
 - only treats an existing target as a lane when it is a matching linked worktree
-- prechecks main-repository linkage and uncommitted changes before removing anything
-- uses normal `git worktree remove`, preserving its dirty-worktree protection
+- never overwrites a file already in a lane, on create or on rerun
+- prechecks main-repository linkage before removing anything
+- refuses to create a lane inside, or around, another lane
+- refuses to clean up a directory without a `.wt-lane` marker
+- lists uncommitted changes, edited or added files in template copies, and shelved IDE changes before cleanup deletes them, and asks for confirmation
 - uses `git branch -d`, refusing to force-delete unmerged branches
-- avoids overwriting generated files without `--force`
-- avoids deleting unrecognized lane files during cleanup
-- preserves template-copied lane files once you edit them
+- never deletes lane-root files it did not place, apart from the IDE state in `.idea/`
 
 No `git clean`, `git reset`, `git rebase`, `git commit`, `git push`, or branch-force deletion is performed.
 
@@ -33,41 +33,62 @@ No `git clean`, `git reset`, `git rebase`, `git commit`, `git push`, or branch-f
 
 Before removing anything, it checks that:
 
+1. the directory has a `.wt-lane` marker naming this feature — so
+   `wt cleanup feat` on a directory that only holds lanes `feat/a` and `feat/b`
+   is refused,
 1. each discovered target is a valid repository root,
 2. its main repository exists,
-3. the target is actually linked to that main repository,
-4. no discovered worktree has staged, modified, or nonignored untracked changes.
+3. the target is actually linked to that main repository.
 
 If any repository fails these checks, cleanup stops and no worktree is removed.
 
+It then lists work that would be deleted and exists nowhere else:
+
+| Listed as | What |
+|---|---|
+| `(uncommitted)` | staged, modified, or untracked files in a worktree — except untracked files that are untouched template copies |
+| `(edited template copy)` | a file copied from `.wt/lane_root/` or `.wt/repos/<repo>/` that no longer matches its template, ignored or not |
+| `(added to a template copy)` | a file added inside a directory copied from `.wt/lane_root/` (for example `docs/DESIGN.md` next to a templated `docs/README.md`); `.idea/` is excluded |
+| `(edited)` | the `<feature-name>.code-workspace` file, changed since `wt` generated it |
+| `(shelved IDE changes)` | a non-empty `.idea/shelf/`: changes shelved in a JetBrains IDE, which are code |
+
+Files added inside a repository template directory are not listed here: Git
+already reports them as `(uncommitted)`.
+
+If the list is not empty, cleanup asks `Delete it anyway? [y/N]`. Anything but
+`y` stops it with nothing removed. Without a terminal to answer — a script, an
+agent — it stops as well.
+
 For each repository it then:
 
-1. removes the linked worktree,
+1. removes the linked worktree (`git worktree remove --force`, since the check above already covered its changes),
 2. prunes stale worktree metadata,
-3. attempts safe feature-branch deletion.
+3. attempts safe feature-branch deletion with `git branch -d`.
 
-After repository cleanup:
+Finally it deletes everything `wt` placed in the lane root: entries named like
+an entry in `.wt/lane_root/`, the `.code-workspace` file, and `.idea/`, template
+or not. `.idea/` is IDE state the IDE rebuilds — window layout, open files,
+recent searches, breakpoints, run configurations you created without saving
+them to the template — so it is not listed, apart from shelved changes. Other
+files `wt` did not place — a `.tmp/` directory, notes an agent wrote — stay.
+Cleanup lists them and prints an `rm -rf` line for the lane; the `.wt-lane`
+marker stays until then, so the directory is still recognisable as a lane.
 
-- If all remaining lane entries are known to be generated, they are removed.
-- If the lane contains unrecognized files, lane files are left in place.
-- With `--force`, recognized generated entries are removed, but unrecognized files are still preserved.
-
-A file copied from a `_lane` template counts as generated only while it is
-byte-identical to the template. Once you edit it — a filled-in `HANDOVER.md`,
-for example — it is treated as your file and is preserved, even with `--force`.
-
-This allows durable lane notes such as `HANDOVER.md` to remain while the rest of the lane is cleaned.
+Not covered: Git-ignored files inside a worktree that did not come from a
+template — a local `.env`, build output. Git does not report them as changes, so
+they are deleted with the worktree without a warning. Copy out anything you need
+first.
 
 ## Security notes
 
-### `.wt-workspace` executes shell code
+### `.wt/workspace.sh` executes shell code
 
 The workspace marker is sourced, so it can execute arbitrary commands. Use it only inside workspaces you control.
 
-Avoid placing the tool in directories containing untrusted projects that may supply a `.wt-workspace`.
+Avoid placing the tool in directories containing untrusted projects that may supply a `.wt/workspace.sh`.
 
-### `.wt-include` may copy sensitive files
+### Templates are copied into every lane
 
-The files copied into lanes are usually Git-ignored local configuration and may contain credentials.
-
-Protect your workspace directories appropriately, do not commit lane content, and avoid listing broad or sensitive paths.
+Anything in `.wt/lane_root/` and `.wt/repos/` lands in every new lane. Keep credentials out of
+templates — export them from your shell profile, or use `${VAR:-placeholder}`
+in a template `.envrc` so an existing export wins.

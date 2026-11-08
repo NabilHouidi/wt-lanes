@@ -1,28 +1,36 @@
 # Customizing lanes
 
 Everything `wt` places into a lane beyond the worktrees themselves: templates,
-live ignored configuration, the generated lane files, and IDE setup.
+the lane guide, the generated lane files, and IDE setup.
 
 - [Templates](#templates)
-- [Live ignored configuration](#live-ignored-configuration)
+- [Lane guide](#lane-guide)
 - [Generated lane files](#generated-lane-files)
 - [IDE behavior](#ide-behavior)
 
 ## Templates
 
-Templates are optional.
+Templates are optional. Without `.wt/lane_root/` or `.wt/repos/`, `wt create`
+says so (`note: no .wt/lane_root/ or .wt/repos/ in …`) and the lane gets only
+its worktrees and generated files.
 
 ```text
-.wt-templates/
-├── _lane/
-├── checkout-api/
-└── checkout-web/
+.wt/
+├── lane_root/
+└── repos/
+    ├── checkout-api/
+    └── checkout-web/
 ```
+
+Templates are copied, never linked, and copying never overwrites a file the lane
+already has. A rerun of `wt create <feature> <repos…>` copies whatever is
+missing. To pick up a changed template in an existing lane, delete the lane's
+copy and rerun.
 
 ### Lane templates
 
 ```text
-.wt-templates/_lane/
+.wt/lane_root/
 ```
 
 Contents are copied to the root of each feature lane.
@@ -30,7 +38,8 @@ Contents are copied to the root of each feature lane.
 Examples:
 
 ```text
-.wt-templates/_lane/
+.wt/lane_root/
+├── AGENTS.md
 ├── HANDOVER.md
 ├── DESIGN.md
 ├── .envrc
@@ -41,14 +50,17 @@ Examples:
 
 Top-level files whose names end in `.tmpl` are not copied.
 
-Existing files are not overwritten unless `--force` is supplied. Existing directories are merged without replacing existing files.
+Existing directories are merged without replacing existing files.
 
-Do not name a lane template directory after a repository (for example, `.wt-templates/_lane/checkout-api`). Because repositories are also lane subdirectories, such a template can be merged into the repository worktree.
+Do not name a lane template directory after a repository (for example, `.wt/lane_root/checkout-api`). Because repositories are also lane subdirectories, such a template can be merged into the repository worktree.
+
+`wt cleanup` deletes lane template copies with the lane, and asks first when one
+no longer matches its template; see [Cleanup behavior](safety-and-cleanup.md#cleanup-behavior).
 
 ### Repository templates
 
 ```text
-.wt-templates/checkout-api/
+.wt/repos/checkout-api/
 ```
 
 Contents are copied into the newly created `checkout-api` worktree for a lane.
@@ -56,7 +68,7 @@ Contents are copied into the newly created `checkout-api` worktree for a lane.
 Examples:
 
 ```text
-.wt-templates/checkout-api/
+.wt/repos/checkout-api/
 ├── .vscode/
 ├── .run/
 ├── .envrc
@@ -64,71 +76,36 @@ Examples:
     └── local.yaml
 ```
 
-When a worktree is newly created, `wt` copies repository templates and live includes with their normal overwrite behavior. When a valid worktree already exists, rerunning `wt create` repairs it: template files and live includes are copied only when missing. Use `--force` to refresh or overwrite those entries.
+On a new worktree, template files are written over whatever the branch
+checked out at the same path. When a valid worktree already exists, rerunning
+`wt create` copies only missing files.
 
-## Live ignored configuration
+Consider ignoring these files in the repository (for example in its
+`.gitignore`); otherwise they show up as untracked changes in `git status` and
+`wt list`. Either way, `wt cleanup` deletes untouched copies with the worktree
+and asks before deleting edited ones.
 
-A main repository may contain `.wt-include`:
+## Lane guide
 
-```text
-checkout-api/.wt-include
-```
+A lane guide for AI coding agents is an ordinary lane template: put
+`AGENTS.md`, `CLAUDE.md`, or both in `.wt/lane_root/`, and every lane gets
+a copy. `wt` does not generate one.
 
-List relative files, one per line:
-
-```text
-.envrc
-config/local.yaml
-.dev/local-settings.json
-```
-
-These files are copied from the main checkout into the corresponding lane worktree after repository templates are applied.
-
-Rules:
-
-- Blank lines are ignored.
-- Absolute paths cause the command to fail.
-- Paths containing `.` or `..` components cause the command to fail.
-- Any path containing a `.git` component is unsafe and causes the command to fail.
-- A missing source file causes the command to fail.
-- Destination directories are created automatically.
-- Comments are not supported; a comment line will be treated as an invalid path.
-- On a newly created worktree, live includes overwrite template files.
-- On a repaired existing worktree, live includes are copied only when missing unless `--force` is used.
-
-Use this for local, Git-ignored settings—not for committing credentials. The copied files may contain secrets; see [Security notes](safety-and-cleanup.md#security-notes).
+Good content for it: the rule to edit only inside the lane, how to run each
+repository's tests, and where lane notes belong (`HANDOVER.md`, `.tmp/`) — so
+agents do not edit the guide itself. Cleanup asks before deleting an edited
+guide, like any other changed template copy. See
+[`examples/commerce-workspace`](../examples/commerce-workspace/.wt/lane_root/AGENTS.md)
+for a starting point.
 
 ## Generated lane files
 
 ### `.wt-lane`
 
-Contains the feature name. It identifies the directory as a lane and helps `wt list` find lanes regardless of nesting depth.
+Contains the feature name. It identifies the directory as a lane and helps `wt list` find lanes regardless of nesting depth. Tools can walk up from any file to the nearest `.wt-lane` to find the lane root.
 
-### `.wt-lane-manifest`
-
-Lists top-level lane entries generated by `wt`. Cleanup uses it to distinguish tool-owned scaffolding from user-authored files.
-
-### `AGENTS.md`
-
-The default generated lane guide for AI coding agents. It contains:
-
-- the feature name
-- repositories present in the lane
-- generic editing and testing rules
-
-The guide’s filename can be configured through `.wt-workspace`:
-
-```bash
-LANE_GUIDE=CLAUDE.md
-```
-
-Set it to an empty value to disable generated lane-guide creation:
-
-```bash
-LANE_GUIDE=
-```
-
-Provide a lane template file such as `.wt-templates/_lane/AGENTS.md` if your workspace needs project-specific instructions. Without `--force`, an existing generated guide is preserved.
+`wt create` writes it before creating worktrees, so a create that fails partway
+still leaves a lane that `wt list` and `wt cleanup` can see.
 
 ### `<feature-name>.code-workspace`
 
@@ -136,7 +113,8 @@ A VS Code workspace containing one folder: the lane root.
 
 Repository subfolders and lane documentation are reachable from that root. Each lane receives a deterministic title and status-bar color based on the feature name.
 
-Without `--force`, an existing workspace file is preserved, so local customizations are not overwritten.
+An existing workspace file is never overwritten, so local customizations stay.
+Cleanup deletes it with the lane, asking first if it was edited.
 
 ## IDE behavior
 
@@ -154,10 +132,15 @@ For a nested feature:
 code "$(wt path team/gift-card-checkout)/gift-card-checkout.code-workspace"
 ```
 
-Shared VS Code settings come from templates: `.wt-templates/_lane/.vscode/` lands in the lane root, `.wt-templates/<repo>/.vscode/` in each repository worktree. Personal, Git-ignored settings (for example your own `.vscode/settings.json`) can be carried into every lane through `.wt-include`; live includes win over template copies.
+Shared VS Code settings come from templates: `.wt/lane_root/.vscode/` lands in the lane root, `.wt/repos/<repo>/.vscode/` in each repository worktree.
 
 ### JetBrains
 
-JetBrains support is provided through templates. If present, `.wt-templates/_lane/.idea` is copied or merged into the lane root. Per-repository `.idea` or `.run` content can be supplied the same way through `.wt-templates/<repo>/`.
+JetBrains support is provided through templates. If present, `.wt/lane_root/.idea` is copied or merged into the lane root. Per-repository `.idea` or `.run` content can be supplied the same way through `.wt/repos/<repo>/`.
 
-If the resulting lane has `.idea` but no `.idea/.name`, `wt` creates `.name` using the workspace root’s directory name. Existing IDE files are not replaced without `--force`.
+If the resulting lane has `.idea` but no `.idea/.name`, `wt` creates `.name` using the workspace root’s directory name. Existing IDE files are never replaced.
+
+Cleanup deletes `.idea/` with the lane, including the state the IDE wrote there
+(`workspace.xml`, breakpoints, run configurations you added). It asks first only
+about edited template files and shelved changes (`.idea/shelf/`) — save a run
+configuration you want to keep into `.wt/lane_root/.idea/` first.

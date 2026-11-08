@@ -1,14 +1,14 @@
 # Workflows and recipes
 
 Practical patterns for using `wt` day to day. Each recipe assumes you are inside
-a workspace (a directory containing `.wt-workspace`).
+a workspace (a directory containing `.wt/workspace.sh`).
 
 - [Develop a cross-repository feature](#develop-a-cross-repository-feature)
 - [Name lanes like branches](#name-lanes-like-branches)
 - [Review a pull request in isolation](#review-a-pull-request-in-isolation)
 - [Hotfix against a release branch](#hotfix-against-a-release-branch)
 - [Run AI coding agents in parallel lanes](#run-ai-coding-agents-in-parallel-lanes)
-- [Carry local configuration into every lane](#carry-local-configuration-into-every-lane)
+- [Give every lane the same setup](#give-every-lane-the-same-setup)
 - [Adopt `wt` gradually in an existing workspace](#adopt-wt-gradually-in-an-existing-workspace)
 
 ## Develop a cross-repository feature
@@ -27,16 +27,17 @@ you. Check on all your lanes from anywhere in the workspace:
 wt list
 ```
 
-After the PRs are merged, remove the lane. Cleanup refuses to touch worktrees
-with uncommitted changes, so commit or discard your work first:
+After the PRs are merged, remove the lane. If a worktree still has uncommitted
+changes, cleanup lists them and asks before deleting them:
 
 ```bash
 wt cleanup gift-card-checkout
 ```
 
-If you kept notes in the lane root (for example `HANDOVER.md`), cleanup reports
-them as non-generated and leaves the lane files in place. Remove them yourself
-when you no longer need them.
+Notes you created in the lane root (for example a `.tmp/` directory) stay;
+cleanup lists them with an `rm -rf` line to remove the lane when you no longer
+need them. A filled-in `HANDOVER.md` from a template is a template copy: cleanup
+asks before deleting it.
 
 ## Name lanes like branches
 
@@ -110,7 +111,7 @@ wt create hotfix-1.2.4 checkout-api checkout-web
 Alternatively, pin the base for the whole workspace while you do release work:
 
 ```bash
-# .wt-workspace
+# .wt/workspace.sh
 DEFAULT_BASE=origin/release-1.2
 ```
 
@@ -118,8 +119,8 @@ DEFAULT_BASE=origin/release-1.2
 
 Lanes are designed to be handed to an agent:
 
-- Each lane gets a generated guide (`AGENTS.md` by default, configurable with
-  `LANE_GUIDE`) naming the feature and the repositories in scope.
+- Put a guide in `.wt/lane_root/AGENTS.md` (or `CLAUDE.md`) and every lane
+  gets a copy; see [Lane guide](templates.md#lane-guide).
 - The `.wt-lane` marker lets agent tooling find the lane root by walking up, so
   durable scratch work belongs in the lane instead of `/tmp`.
 - Parallel agents never share a checkout, so two agents cannot switch branches
@@ -132,33 +133,33 @@ wt create agent/null-check-hardening checkout-api
 
 When the agent finishes, review the worktrees with `wt list`, merge what you
 want, and clean up. Files the agent wrote in the lane root (notes, findings)
-survive cleanup because they are not generated content.
+survive cleanup because `wt` did not place them; cleanup lists them.
 
-## Carry local configuration into every lane
+## Give every lane the same setup
 
-Worktrees do not inherit Git-ignored files, so things like `.envrc` or local
-settings go missing in a fresh lane. List them in the main checkout’s
-`.wt-include` and every lane gets a copy:
+Worktrees do not inherit Git-ignored files, so things like `.envrc` or editor
+settings go missing in a fresh lane. Put them in `.wt/` and every new
+lane gets a copy:
 
 ```text
-# checkout-api/.wt-include
-.envrc
-config/local.yaml
+.wt/
+├── lane_root/.envrc              # lane root
+└── repos/checkout-api/.envrc     # every checkout-api worktree
 ```
 
-Details and rules are in the README under
-[Live ignored configuration](templates.md#live-ignored-configuration). Keep it
-to local developer settings — never commit credentials to satisfy this file.
+Consider ignoring the files a template adds in each repository, so they do not
+show up as untracked changes. Keep credentials out of templates; see
+[Security notes](safety-and-cleanup.md#security-notes).
 
 ## Adopt `wt` gradually in an existing workspace
 
 You do not have to convert the whole team at once:
 
-1. `touch .wt-workspace` in your meta-project directory.
+1. `mkdir -p .wt && touch .wt/workspace.sh` in your meta-project directory.
 2. Optionally pin the repo list while you get comfortable:
-   `REPOS=(checkout-api)` in `.wt-workspace`.
+   `REPOS=(checkout-api)` in `.wt/workspace.sh`.
 3. Create your first lane for a single repository:
    `wt create trial-lane checkout-api`.
-4. Add templates (`.wt-templates/`) and `.wt-include` files later, once the
-   basic loop feels right. Rerunning `wt create <feature>` on an existing lane
-   repairs missing scaffolding without overwriting your files.
+4. Add templates (`.wt/lane_root/`, `.wt/repos/`) later, once the basic loop feels right.
+   Rerunning `wt create <feature> <repos…>` on an existing lane copies missing
+   scaffolding without overwriting your files.

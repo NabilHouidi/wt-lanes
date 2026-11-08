@@ -32,51 +32,48 @@ repositories:
 ```
 
 Each leaf is a full lane: repository worktrees on a branch matching the lane
-name, a generated `AGENTS.md` and `<name>.code-workspace`, and any `_lane`
-template files. `wt list` prints the full lane names, and `wt cleanup` prunes
+name, a generated `<name>.code-workspace`, and the `lane_root` template files
+(`AGENTS.md`, `HANDOVER.md`, `.envrc`). `wt list` prints the full lane names, and `wt cleanup` prunes
 empty parent directories, so `.worktrees/feat/` disappears with its last lane.
 
 ## Layout
 
 ```text
 commerce-workspace/
-├── .wt-workspace                     # pinned repo list + default base branch
-├── .wt-templates/
-│   ├── _lane/                        # copied into every lane root
-│   │   ├── HANDOVER.md               # handover note; survives cleanup
-│   │   └── .envrc                    # per-lane compose project name (direnv)
-│   ├── checkout-api/                 # copied into checkout-api worktrees
-│   │   ├── .envrc
-│   │   └── .vscode/settings.json
-│   └── checkout-web/
-│       └── .vscode/settings.json
-└── checkout-api/
-    └── .wt-include                   # Git-ignored files to copy into lanes
+└── .wt/
+    ├── workspace.sh                  # pinned repo list + default base branch
+    ├── lane_root/                    # copied into every lane root
+    │   ├── AGENTS.md                 # lane guide for AI coding agents
+    │   ├── HANDOVER.md               # handover note; cleanup asks before deleting it once filled in
+    │   └── .envrc                    # per-lane compose project name (direnv)
+    └── repos/
+        ├── checkout-api/             # copied into checkout-api worktrees
+        │   ├── .envrc
+        │   └── .vscode/settings.json
+        └── checkout-web/
+            └── .vscode/settings.json
 ```
 
 ## What each piece demonstrates
 
 | File | Demonstrates |
 | --- | --- |
-| `.wt-workspace` | Pinning `REPOS`, setting `DEFAULT_BASE`, and the commented `LANE_GUIDE` knob. |
-| `_lane/HANDOVER.md` | Lane-level templates. Once you edit the copied file, `wt cleanup` treats it as yours and preserves it. |
-| `_lane/.envrc` | Lane-level environment; `wt` runs `direnv allow` after copying it. |
-| `checkout-api/.envrc` (template) | Repository templates. Note the interplay below. |
-| `checkout-api/.wt-include` | Live ignored configuration: `.envrc` and `config/local.yaml` are copied from the main checkout into each lane. |
+| `.wt/workspace.sh` | Pinning `REPOS` and setting `DEFAULT_BASE`. |
+| `lane_root/AGENTS.md` | The lane guide is an ordinary template; rename or copy it to `CLAUDE.md` for Claude Code. |
+| `lane_root/HANDOVER.md` | Lane-level templates. Once you edit the copied file, `wt cleanup` lists it and asks before deleting it. |
+| `lane_root/.envrc` | Lane-level environment; `wt` runs `direnv allow` after copying it. |
+| `repos/checkout-api/.envrc`, `repos/*/.vscode/` | Repository templates, copied into each new worktree of that repository. |
 
-Template versus live include: `checkout-api` has a template `.envrc` *and* lists
-`.envrc` in `.wt-include`. Live includes are applied after templates and win, so
-lane worktrees end up with the main checkout’s `.envrc`. This matches the
-documented rule: on a newly created worktree, live includes overwrite template
-files.
+`quickstart.sh` adds `.envrc` and `.vscode/` to the demo repositories'
+`.gitignore`, so the template copies do not show up as untracked changes.
 
 ## Use it in your own workspace
 
 ```bash
-cp examples/commerce-workspace/.wt-workspace /path/to/your/workspace/
-cp -r examples/commerce-workspace/.wt-templates /path/to/your/workspace/
+cp -r examples/commerce-workspace/.wt /path/to/your/workspace/
 ```
 
-Then adjust `REPOS` (or delete it to auto-discover repositories) and create a
-`.wt-include` in each main repository that needs local configuration carried
-into lanes.
+Then adjust `REPOS` in `.wt/workspace.sh` (or delete it to auto-discover
+repositories), rename the directories under `.wt/repos/` to your repositories,
+and make sure each
+repository ignores the files its template adds.
