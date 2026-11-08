@@ -33,23 +33,13 @@ It provides:
 
 ## Installation
 
-Make the script executable:
+Make the script executable and link it onto your `PATH`:
 
 ```bash
 chmod +x wt
-```
-
-Run it from a workspace root:
-
-```bash
-./wt help
-```
-
-To install it on your `PATH`:
-
-```bash
 mkdir -p ~/.local/bin
 ln -s "$PWD/wt" ~/.local/bin/wt
+wt help
 ```
 
 Ensure `~/.local/bin` is present in your `PATH`.
@@ -72,18 +62,6 @@ Optional:
 - `md5sum`, `md5`, or `cksum` — assign deterministic lane colors
 - JetBrains IDEs — use optional `.idea` lane templates
 
-### Workspace root
-
-`wt` walks upward from the current directory until it finds a `.wt/workspace.sh` marker.
-
-Create one in your meta-project directory:
-
-```bash
-mkdir -p .wt && touch .wt/workspace.sh
-```
-
-The file may be empty; it doubles as the workspace's configuration (see [Configuration](docs/configuration.md)).
-
 ## Quick start
 
 Imagine three repositories sitting next to one another:
@@ -95,13 +73,15 @@ commerce-workspace/
 └── shared-events/
 ```
 
-A new “gift card checkout” feature requires changes in all three. Rather than switching branches three times, create one isolated lane:
+A new “gift card checkout” feature requires changes in all three. Rather than switching branches three times, mark the directory as a workspace and create one isolated lane:
 
 ```bash
 cd commerce-workspace
-mkdir -p .wt && touch .wt/workspace.sh
+mkdir -p .wt && touch .wt/workspace.sh   # workspace marker; may stay empty
 wt create gift-card-checkout
 ```
+
+`wt` finds the workspace by walking up from the current directory to `.wt/workspace.sh`, which also holds the workspace's [configuration](docs/configuration.md).
 
 Expected output (Git's own lines shortened to the first repository):
 
@@ -190,24 +170,7 @@ Deleted branch gift-card-checkout (was ce7ff1b).
 Deleted branch gift-card-checkout (was 38bb5a8).
 ```
 
-Cleanup removes the worktrees, every branch that is merged, and everything `wt` placed in the lane root: template copies, the `.code-workspace` file, `.idea/`. If that would delete work that exists nowhere else — uncommitted changes in a worktree, or a template copy someone edited — it lists it and asks first:
-
-```text
-warning: cleanup would delete work that exists nowhere else:
-  checkout-api/main.go (uncommitted)
-  HANDOVER.md (edited template copy)
-Delete it anyway? [y/N]
-```
-
-Without a terminal to answer (a script, an agent), it stops and removes nothing.
-
-Files `wt` did not place, such as a `.tmp/` directory of notes, stay in the lane root and are listed:
-
-```text
-note: worktrees removed; kept lane files that wt did not create:
-  .tmp
-  when done with them: rm -rf "/home/you/commerce-workspace/.worktrees/gift-card-checkout"
-```
+Cleanup removes the worktrees, every branch that is merged, and everything `wt` placed in the lane root: template copies, the `.code-workspace` file, `.idea/`. If that would delete work that exists nowhere else — uncommitted changes, an edited template copy — it lists it and asks first. Files `wt` did not place, such as a `.tmp/` directory of notes, stay. [Safety and cleanup](docs/safety-and-cleanup.md) has the details; [Troubleshooting](docs/troubleshooting.md) shows both messages.
 
 ## Workspace layout
 
@@ -234,71 +197,39 @@ Only `.wt/workspace.sh` and the main repositories are required. Workspaces that 
 
 ### `wt create`
 
-Create a lane for all discovered repositories:
-
 ```bash
-wt create gift-card-checkout
+wt create gift-card-checkout                            # all repositories
+wt create gift-card-checkout checkout-api checkout-web  # selected repositories
+wt create team/gift-card-checkout                       # nested names work
 ```
 
-Create a lane for selected repositories:
-
-```bash
-wt create gift-card-checkout checkout-api checkout-web
-```
-
-Nested feature names are allowed:
-
-```bash
-wt create team/gift-card-checkout
-```
-
-The feature name is used as the branch name in each selected repository.
-
-New branches start from `DEFAULT_BASE` or the repository's `origin/HEAD`. If `origin` cannot be fetched, or that base does not exist, `wt` prints a warning — in the second case it branches from the main checkout's current `HEAD`.
-
-Rerunning `create` on an existing lane restores missing repository and lane scaffolding. It never overwrites a file already in the lane; to pick up a changed template, delete the lane's copy and rerun.
-
-`wt` does not stage, commit, push, merge, or delete commits.
+- The feature name is the branch name in each repository.
+- New branches start from `DEFAULT_BASE` or `origin/HEAD`; `wt` warns when the fetch fails or the base is missing (see [Configuration](docs/configuration.md#default-base-branch)).
+- Rerunning restores missing files and never overwrites existing ones.
 
 ### `wt list`
 
-Show repositories in lanes that contain a `.wt-lane` marker:
-
 ```bash
-wt list
+wt list    # or: wt ls
 ```
 
-or:
-
-```bash
-wt ls
-```
-
-The status shows the lane, repository, branch, number of dirty entries, and comparison with `origin/<branch>` when available.
+Shows each lane's repositories with branch, dirty count, and `-behind +ahead` relative to `origin/<branch>`.
 
 ### `wt path`
-
-Print a lane directory:
-
-```bash
-wt path <feature>
-```
-
-Useful in scripts:
 
 ```bash
 cd "$(wt path gift-card-checkout)/checkout-api"
 ```
 
+Prints a lane's directory, for scripts.
+
 ### `wt cleanup`
 
-Remove lane worktrees, merged branches, and the files `wt` placed in the lane:
-
 ```bash
-wt cleanup <feature>
+wt cleanup gift-card-checkout
 ```
 
-Uncommitted changes, edited or added files in template copies, and shelved IDE changes are listed first and need a `y` to be deleted. `.idea/` (IDE state) is deleted with the lane. Other files `wt` did not place stay and are listed, with an `rm -rf` line for the lane. A directory without a `.wt-lane` marker is refused.
+Removes the worktrees, merged branches, and the files `wt` placed. Work that would be lost is listed first and needs a `y`. See [Safety and cleanup](docs/safety-and-cleanup.md).
 
 ### `wt help`
 
