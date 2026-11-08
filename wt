@@ -8,46 +8,52 @@ usage() {
 wt — multi-repo worktree lanes for meta-project workspaces
 
 Usage:
-  wt [--force] create <feature> [repo...]   create a lane (all repos if none given)
-  wt [--force] cleanup <feature>            remove a lane's worktrees and branches
-  wt list (or ls)                           show lanes and per-repo status
-  wt path <feature>                         print a lane's directory
-  wt help                                   show this help
+  wt create <feature> [repo...]   create a lane (all repos if none given)
+  wt cleanup <feature>            remove a lane's worktrees and branches
+  wt list (or ls)                 show lanes and per-repo status
+  wt path <feature>               print a lane's directory
+  wt help                         show this help
 
---force: overwrite existing lane configuration/templates and allow cleanup to
-         remove generated scaffolding when other lane contents are present.
-         Can also be enabled with WT_FORCE=1.
+Rerunning create restores missing lane files and never overwrites existing
+ones. Cleanup removes the lane's worktrees, merged branches, every file wt
+placed and the IDE state in .idea/; it lists uncommitted changes, edited or
+added files in template copies, and shelved IDE changes first and asks before
+deleting them. Other files wt did not place (notes, .tmp/) stay.
 EOF
 }
-
-FORCE_REQUESTED=0
-case "${WT_FORCE:-}" in
-  1 | true | TRUE) FORCE_REQUESTED=1 ;;
-esac
-while [ "${1:-}" = "--force" ]; do
-  FORCE_REQUESTED=1
-  shift
-done
 
 # --- workspace discovery -----------------------------------------------------
 WORKSPACE_ROOT=""
 REPOS=()
 WT_DIR=""
-TMPL_DIR=""
-LANE_FEATURE_DIR=""
-LANE_MANIFEST_ENTRIES=()
+LANE_TMPL=""
+REPO_TMPL=""
 
-# walk up from $PWD to the nearest .wt-workspace marker
+# walk up from $PWD to the nearest .wt/workspace.sh marker
 find_workspace_root() {
   local dir="$PWD"
   while [ "$dir" != "/" ]; do
-    if [ -f "$dir/.wt-workspace" ]; then
+    if [ -f "$dir/.wt/workspace.sh" ]; then
       printf '%s\n' "$dir"
       return 0
     fi
+    if [ -f "$dir/.wt-workspace" ]; then
+      cat >&2 <<EOF
+error: $dir uses the old layout (.wt-workspace, .wt-templates/). Migrate with:
+  cd "$dir"
+  mkdir -p .wt/repos && mv .wt-workspace .wt/workspace.sh
+  if [ -d .wt-templates ]; then
+    if [ -d .wt-templates/_lane ]; then mv .wt-templates/_lane .wt/lane_root; fi
+    for d in .wt-templates/*/; do if [ -d "\$d" ]; then mv "\$d" .wt/repos/; fi; done
+    if [ -f .wt-templates/README.md ]; then mv .wt-templates/README.md .wt/; fi
+    rmdir .wt-templates
+  fi
+EOF
+      return 1
+    fi
     dir=$(dirname "$dir")
   done
-  echo "error: not inside a wt workspace (no .wt-workspace marker found)" >&2
+  echo "error: not inside a wt workspace (no .wt/workspace.sh found)" >&2
   return 1
 }
 
@@ -59,11 +65,10 @@ init_workspace() {
   #   REPOS=(repoA repoB)             pin the repo list
   #   DEFAULT_BASE=origin/master      base branch for new feature branches
   # shellcheck disable=SC1091
-  if [ -s "$WORKSPACE_ROOT/.wt-workspace" ]; then
+  if [ -s "$WORKSPACE_ROOT/.wt/workspace.sh" ]; then
     # shellcheck disable=SC1091
-    source "$WORKSPACE_ROOT/.wt-workspace"
+    source "$WORKSPACE_ROOT/.wt/workspace.sh"
   fi
-  FORCE=$FORCE_REQUESTED
 
   # REPOS unset: auto-discover child directories that are repository roots
   if [ -z "${REPOS+x}" ]; then
@@ -83,7 +88,8 @@ init_workspace() {
     WT_DIR=$resolved
   fi
 
-  TMPL_DIR="$WORKSPACE_ROOT/.wt-templates"
+  LANE_TMPL="$WORKSPACE_ROOT/.wt/lane_root"
+  REPO_TMPL="$WORKSPACE_ROOT/.wt/repos"
 }
 
 # --- path and worktree helpers ------------------------------------------------
@@ -121,17 +127,6 @@ validate_repo_name() {
   local repo="$1"
   if ! is_repo_name "$repo"; then
     echo "error: invalid repository name: '$repo'" >&2
-    return 1
-  fi
-}
-
-# is_repo_name plus a newline rejection (for LANE_GUIDE)
-is_simple_filename() {
-  local name="$1"
-  case "$name" in
-    "" | "." | ".." | -* | */*) return 1 ;;
-  esac
-  if [[ "$name" == *$'\n'* ]]; then
     return 1
   fi
 }
@@ -195,23 +190,6 @@ is_feature_worktree() {
   worktree_belongs_to_main "$main" "$target"
 }
 
-# .wt-include entry: relative, no traversal, never under .git
-safe_include_path() {
-  local path="$1"
-  if [[ "$path" == ./* ]]; then
-    path=${path#./}
-  fi
-  if [ -z "$path" ] || [ "${path:0:1}" = "/" ]; then
-    return 1
-  fi
-  case "/$path/" in
-    */.git/*) return 1 ;;
-  esac
-  if has_unsafe_path_component "$path"; then
-    return 1
-  fi
-}
-
 # true if dir is a git worktree top level (empty --show-cdup)
 is_repo_root() {
   local dir="$1" cdup
@@ -263,222 +241,119 @@ lane_color() {
   echo "${LANE_COLORS[$idx]}"
 }
 
-# write the lane guide (AGENTS.md or $LANE_GUIDE)
-generate_lane_guide() {
-  local feature="$1" feat_dir="$2"
-  shift 2
-  local guide
-  if [ -z "${LANE_GUIDE+x}" ]; then
-    guide="AGENTS.md" # agent-neutral default
-  else
-    guide="$LANE_GUIDE" # empty disables generation
-  fi
-  [ -n "$guide" ] || return 0
-
-  if ! is_simple_filename "$guide"; then
-    echo "error: invalid lane guide name: '$guide'" >&2
-    return 1
-  fi
-
-  local out="$feat_dir/$guide"
-  if [ "$FORCE" -eq 0 ] && [ -f "$out" ]; then
-    return 0 # don't clobber an existing lane guide
-  fi
-
-  append_lane_entry "$guide" || return 1
-  {
-    echo "# Feature: $feature"
-    echo
-    echo "## Repos in this lane"
-    for r in "$@"; do echo "- $r/"; done
-    echo
-    echo "## Rules"
-    echo "- Only edit files inside this directory"
-    echo "- Run tests in each repo before marking a task complete"
-    echo "- Follow each repository's documented setup and startup commands"
-  } >"$out"
-}
-
-# write the lane's <name>.code-workspace with its lane color
-generate_workspace_file() {
-  local feature="$1" feat_dir="$2"
-  local name
-  name=$(basename "$feature")
+# print the lane's .code-workspace, colored by feature name
+workspace_file_body() {
   local color
-  color=$(lane_color "$feature")
-  local out="$feat_dir/$name.code-workspace"
-
-  if [ "$FORCE" -eq 0 ] && [ -e "$out" ]; then
-    return 0 # preserve user-customized workspace settings
-  fi
-
-  append_lane_entry "$name.code-workspace" || return 1
+  color=$(lane_color "$1")
 
   # One folder entry, the lane root itself: lane-level docs (AGENTS.md,
   # HANDOVER.md, DESIGN.md, findings) are only reachable in the explorer if the
   # root is a workspace folder. The repos appear as its subfolders. Listing the
   # repos as folders *as well* would show every file twice in Quick Open.
-  {
-    echo '{'
-    echo '  "folders": ['
-    echo '    { "path": "." }'
-    echo '  ],'
-    echo '  "settings": {'
-    echo '    "workbench.colorCustomizations": {'
-    printf '      "titleBar.activeBackground": "%s",\n' "$color"
-    printf '      "titleBar.activeForeground": "#ffffff",\n'
-    printf '      "activityBar.background": "%s",\n' "$color"
-    printf '      "statusBar.background": "%s"\n' "$color"
-    echo '    }'
-    echo '  }'
-    echo '}'
-  } >"$out"
+  echo '{'
+  echo '  "folders": ['
+  echo '    { "path": "." }'
+  echo '  ],'
+  echo '  "settings": {'
+  echo '    "workbench.colorCustomizations": {'
+  printf '      "titleBar.activeBackground": "%s",\n' "$color"
+  printf '      "titleBar.activeForeground": "#ffffff",\n'
+  printf '      "activityBar.background": "%s",\n' "$color"
+  printf '      "statusBar.background": "%s"\n' "$color"
+  echo '    }'
+  echo '  }'
+  echo '}'
 }
 
-# record a top-level lane entry as wt-generated (deduped)
-append_lane_entry() {
-  local name="$1" existing
-  if [ -z "$name" ] || [ "$name" = "." ] || [ "$name" = ".." ] ||
-    [[ "$name" == */* ]] || [[ "$name" == *$'\n'* ]]; then
-    return 1
+# write the lane's <name>.code-workspace unless one exists
+generate_workspace_file() {
+  local feature="$1" feat_dir="$2"
+  local out
+  out="$feat_dir/$(basename "$feature").code-workspace"
+  if [ ! -e "$out" ]; then
+    workspace_file_body "$feature" >"$out"
   fi
-  # the [@]+"${...[@]}" form expands an empty array safely under set -u
-  for existing in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
-    if [ "$existing" = "$name" ]; then
-      return 0
+}
+
+# print files under dst that differ from their template copy in src;
+# files only in dst (IDE state, new files) are not reported
+changed_copies() {
+  local src="$1" dst="$2" f
+  if [ ! -d "$src" ] || [ ! -d "$dst" ]; then
+    return 0
+  fi
+  while IFS= read -r -d '' f; do
+    f=${f#"$src"/}
+    if [ -f "$dst/$f" ] && ! cmp -s -- "$src/$f" "$dst/$f"; then
+      printf '%s\n' "$dst/$f"
     fi
+  done < <(find "$src" -type f -print0)
+}
+
+# print files a lane added inside its copies of lane template directories;
+# .idea/ is IDE state and is not reported
+added_in_lane_copies() {
+  local feat_dir="$1" line dir
+  while IFS= read -r line; do
+    dir=${line#Only in }
+    dir=${dir%%: *}
+    case "$dir" in
+      "$feat_dir" | "$feat_dir/.idea" | "$feat_dir/.idea/"*) ;;
+      "$feat_dir/"*) printf '%s/%s\n' "$dir" "${line#*: }" ;;
+    esac
+  done < <(diff -r -q -- "$LANE_TMPL" "$feat_dir" 2>/dev/null | grep -F "Only in $feat_dir" || true)
+}
+
+# remove a lane dir and its now-empty parents up to .worktrees; false if not empty
+remove_lane_dir() {
+  local dir="$1"
+  rmdir -- "$dir" 2>/dev/null || return 1
+  dir=$(dirname "$dir")
+  while [ "$dir" != "$WT_DIR" ] && rmdir -- "$dir" 2>/dev/null; do
+    dir=$(dirname "$dir")
   done
-  LANE_MANIFEST_ENTRIES+=("$name")
 }
 
-# read a lane's manifest into LANE_MANIFEST_ENTRIES
-load_lane_manifest() {
-  local lane_dir="$1"
-  local path="$lane_dir/.wt-lane-manifest"
-  local entry
-
-  LANE_FEATURE_DIR="$lane_dir"
-  LANE_MANIFEST_ENTRIES=()
-  if [ -f "$path" ]; then
-    while IFS= read -r entry || [ -n "$entry" ]; do
-      append_lane_entry "$entry" || true
-    done <"$path"
-  fi
-}
-
-# write LANE_MANIFEST_ENTRIES to the lane's manifest file
-write_lane_manifest() {
-  local path="$LANE_FEATURE_DIR/.wt-lane-manifest"
-  if [ ${#LANE_MANIFEST_ENTRIES[@]} -gt 0 ]; then
-    printf '%s\n' "${LANE_MANIFEST_ENTRIES[@]}" >"$path"
-  fi
-}
-
-# true if name is a known wt-generated lane entry
-is_lane_generated_entry() {
-  local name="$1" entry
-  for entry in "${LANE_MANIFEST_ENTRIES[@]+"${LANE_MANIFEST_ENTRIES[@]}"}"; do
-    if [ "$entry" = "$name" ]; then
-      return 0
+# print each lane root under a dir, NUL-separated, without descending into
+# worktrees or lanes (lanes cannot nest: git refuses branches foo and foo/bar)
+find_lanes() {
+  local d
+  for d in "$1"/*/; do
+    d=${d%/}
+    if [ ! -d "$d" ] || [ -L "$d" ] || [ -f "$d/.git" ]; then
+      continue
     fi
-  done
-
-  # Lanes created before the manifest existed still have a safe fallback set.
-  case "$name" in
-    *.code-workspace | AGENTS.md | .envrc | .wt-lane | .wt-lane-manifest | .idea | .run | .vscode)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-# A file copied from a _lane template only counts as generated while it is
-# byte-identical to the template; once the user edits it, it is theirs.
-lane_entry_matches_template() {
-  local lane_dir="$1" name="$2"
-  local src="$TMPL_DIR/_lane/$name"
-  [ -f "$src" ] && [ -f "$lane_dir/$name" ] || return 0
-  cmp -s -- "$src" "$lane_dir/$name"
-}
-
-# true if any top-level lane entry is user content
-lane_has_non_generated_files() {
-  local lane_dir="$1" entry name
-  while IFS= read -r -d '' entry; do
-    name=${entry#"$lane_dir"/}
-    if ! is_lane_generated_entry "$name"; then
-      return 0
-    fi
-    if ! lane_entry_matches_template "$lane_dir" "$name"; then
-      return 0
-    fi
-  done < <(find "$lane_dir" -mindepth 1 -maxdepth 1 -print0)
-  return 1
-}
-
-# delete only entries known to be wt-generated
-remove_generated_lane_entries() {
-  local lane_dir="$1" entry name
-  while IFS= read -r -d '' entry; do
-    name=${entry#"$lane_dir"/}
-    if is_lane_generated_entry "$name" &&
-      lane_entry_matches_template "$lane_dir" "$name"; then
-      rm -rf -- "$entry"
-    fi
-  done < <(find "$lane_dir" -mindepth 1 -maxdepth 1 -print0)
-}
-
-# templates, then live .wt-include copies, then direnv
-apply_repo_scaffolding() {
-  local main="$1" target="$2" repo="$3" overwrite="$4"
-  local f source_path target_path
-
-  # 1. static scaffolding from templates (.run/, .vscode/, .envrc)
-  if [ -d "$TMPL_DIR/$repo" ]; then
-    if [ "$overwrite" -eq 1 ]; then
-      cp -r -- "$TMPL_DIR/$repo/." "$target/"
+    if [ -f "$d/.wt-lane" ]; then
+      printf '%s\0' "$d"
     else
-      cp -rn -- "$TMPL_DIR/$repo/." "$target/"
+      find_lanes "$d"
+    fi
+  done
+}
+
+# copy repo templates into a worktree (overwrite=0 keeps existing files), then direnv
+apply_repo_scaffolding() {
+  local target="$1" repo="$2" overwrite="$3"
+
+  # static scaffolding from templates (.run/, .vscode/, .envrc)
+  if [ -d "$REPO_TMPL/$repo" ]; then
+    if [ "$overwrite" -eq 1 ]; then
+      cp -r -- "$REPO_TMPL/$repo/." "$target/"
+    else
+      cp -rn -- "$REPO_TMPL/$repo/." "$target/"
     fi
   fi
 
-  # 2. live gitignored config from main checkout (wins over templates)
-  if [ -f "$main/.wt-include" ]; then
-    while IFS= read -r f || [ -n "$f" ]; do
-      if [ -z "$f" ]; then
-        continue
-      fi
-      if ! safe_include_path "$f"; then
-        echo "error: unsafe .wt-include path in $main: '$f'" >&2
-        return 1
-      fi
-
-      source_path="$main/$f"
-      target_path="$target/$f"
-      if [ ! -f "$source_path" ]; then
-        echo "error: .wt-include source not found: $source_path" >&2
-        return 1
-      fi
-
-      mkdir -p -- "$(dirname "$target_path")"
-      if [ "$overwrite" -eq 1 ]; then
-        cp -f -- "$source_path" "$target_path"
-      else
-        cp -n -- "$source_path" "$target_path"
-      fi
-    done <"$main/.wt-include"
-  fi
-
-  # 3. trust the envrc this script just placed
+  # trust the envrc this script just placed
   if [ -f "$target/.envrc" ] && command -v direnv >/dev/null 2>&1; then
     direnv allow "$target"
   fi
 }
 
 # --- subcommands --------------------------------------------------------------
-# create or repair a lane: worktrees, scaffolding, guide, workspace
+# create or repair a lane: worktrees, scaffolding, workspace
 cmd_create() {
-  local feature="${1:?usage: wt [--force] create <feature> [repo...]}"
+  local feature="${1:?usage: wt create <feature> [repo...]}"
   shift
   init_workspace || return 1
 
@@ -489,6 +364,9 @@ cmd_create() {
   if [ ${#repos[@]} -eq 0 ]; then
     repos=("${REPOS[@]+"${REPOS[@]}"}")
   fi
+  for repo in "${repos[@]+"${repos[@]}"}"; do
+    validate_repo_name "$repo" || return 1
+  done
 
   local feat_dir
   feat_dir=$(lane_dir_for "$feature") || return 1
@@ -498,6 +376,7 @@ cmd_create() {
     return 1
   fi
 
+  local marker_existed=0
   if [ -f "$feat_dir/.wt-lane" ]; then
     local stored
     stored=$(cat "$feat_dir/.wt-lane" 2>/dev/null) || stored=""
@@ -505,12 +384,35 @@ cmd_create() {
       echo "error: existing lane at $feat_dir belongs to '$stored', not '$feature'" >&2
       return 1
     fi
+    marker_existed=1
   fi
+
+  # git refuses branch foo next to foo/bar, but only after the marker below is
+  # written; a stray marker would hide the other lane from list and cleanup
+  local parent="$feat_dir" inner
+  while parent=$(dirname "$parent") && [ "$parent" != "$WT_DIR" ] && [ "$parent" != "/" ]; do
+    if [ -f "$parent/.wt-lane" ]; then
+      echo "error: $feat_dir is inside lane '${parent#"$WT_DIR"/}'" >&2
+      return 1
+    fi
+  done
+  if [ -d "$feat_dir" ]; then
+    inner=$(find_lanes "$feat_dir" | tr '\0' '\n')
+    if [ -n "$inner" ]; then
+      inner=${inner%%$'\n'*}
+      echo "error: $feat_dir contains lane '${inner#"$WT_DIR"/}'" >&2
+      return 1
+    fi
+  fi
+
+  # lane marker first, so a create that fails partway still leaves a lane that
+  # `wt list` and `wt cleanup` can find. Tools also walk up to it to find the
+  # lane root; durable scratch/work product belongs in the lane, not /tmp.
+  mkdir -p -- "$feat_dir"
+  printf '%s\n' "$feature" >"$feat_dir/.wt-lane"
 
   local created=()
   for repo in "${repos[@]+"${repos[@]}"}"; do
-    validate_repo_name "$repo" || return 1
-
     local main="$WORKSPACE_ROOT/$repo"
     local target="$feat_dir/$repo"
 
@@ -520,14 +422,12 @@ cmd_create() {
     fi
 
     if [ -e "$target" ] || [ -L "$target" ]; then
-      # valid existing worktree: repair scaffolding (overwrite only with --force)
+      # valid existing worktree: restore missing scaffolding, keep existing files
       if is_feature_worktree "$main" "$target" "$feature"; then
-        local repair_overwrite=0
-        if [ "$FORCE" -eq 1 ]; then
-          repair_overwrite=1
-        fi
         echo "repair $repo (worktree exists)"
-        apply_repo_scaffolding "$main" "$target" "$repo" "$repair_overwrite" || return 1
+        # ||: keeps errexit off inside; cp -n exits 1 on skipped files in
+        # GNU coreutils 9.2-9.4, which must not abort the repair
+        apply_repo_scaffolding "$target" "$repo" 0 || return 1
         created+=("$repo")
         continue
       fi
@@ -536,7 +436,9 @@ cmd_create() {
     fi
 
     echo "==> $repo"
-    git -C "$main" fetch origin --quiet 2>/dev/null || true # tolerate missing origin/offline
+    if ! git -C "$main" fetch origin --quiet 2>/dev/null; then
+      echo "    warning: could not fetch origin in $repo; the base may be stale" >&2
+    fi
 
     # attach an existing local branch (review/hotfix flows); else branch from base
     if git -C "$main" show-ref --verify --quiet "refs/heads/$feature"; then
@@ -544,48 +446,33 @@ cmd_create() {
     else
       local base
       base=$(base_branch_for "$main")
-      git -C "$main" rev-parse --verify --quiet "$base" >/dev/null || base=HEAD
+      if ! git -C "$main" rev-parse --verify --quiet "$base" >/dev/null; then
+        echo "    warning: $base not found in $repo; branching from its current HEAD" >&2
+        base=HEAD
+      fi
       git -C "$main" worktree add "$target" -b "$feature" "$base"
     fi
 
-    apply_repo_scaffolding "$main" "$target" "$repo" 1 || return 1
+    apply_repo_scaffolding "$target" "$repo" 1
 
     created+=("$repo")
   done
 
   if [ ${#created[@]} -eq 0 ]; then
     echo "error: no worktrees created" >&2
+    if [ "$marker_existed" -eq 0 ]; then
+      rm -f -- "$feat_dir/.wt-lane"
+      remove_lane_dir "$feat_dir" || true
+    fi
     return 1
   fi
 
-  mkdir -p -- "$feat_dir"
-  load_lane_manifest "$feat_dir"
-
-  # lane-level scaffolding
-  if [ -d "$TMPL_DIR/_lane" ]; then
-    while IFS= read -r -d '' src; do
-      local template_name
-      template_name=$(basename "$src")
-      local template_dest="$feat_dir/$template_name"
-      if [ "$FORCE" -eq 1 ] || { [ ! -e "$template_dest" ] && [ ! -L "$template_dest" ]; }; then
-        append_lane_entry "$template_name" || return 1
-        cp -f -- "$src" "$template_dest"
-      else
-        cp -n -- "$src" "$template_dest"
-      fi
-    done < <(find "$TMPL_DIR/_lane" -maxdepth 1 -type f ! -name '*.tmpl' -print0)
-
-    while IFS= read -r -d '' src; do
-      local template_name
-      template_name=$(basename "$src")
-      local template_dest="$feat_dir/$template_name"
-      if [ "$FORCE" -eq 1 ] || { [ ! -e "$template_dest" ] && [ ! -L "$template_dest" ]; }; then
-        append_lane_entry "$template_name" || return 1
-        cp -r -- "$src" "$feat_dir/"
-      else
-        cp -rn -- "$src" "$feat_dir/"
-      fi
-    done < <(find "$TMPL_DIR/_lane" -mindepth 1 -maxdepth 1 -type d -print0)
+  # lane-level scaffolding; -n keeps every file the lane already has
+  if [ -d "$LANE_TMPL" ]; then
+    find "$LANE_TMPL" -mindepth 1 -maxdepth 1 ! \( -type f -name '*.tmpl' \) \
+      -exec cp -rn -- {} "$feat_dir/" \;
+  elif [ ! -d "$REPO_TMPL" ]; then
+    echo "note: no .wt/lane_root/ or .wt/repos/ in $WORKSPACE_ROOT; lane has no scaffolding"
   fi
   if [ -f "$feat_dir/.envrc" ] && command -v direnv >/dev/null 2>&1; then
     direnv allow "$feat_dir"
@@ -597,16 +484,7 @@ cmd_create() {
     basename "$WORKSPACE_ROOT" >"$feat_dir/.idea/.name"
   fi
 
-  # lane marker: lets tools detect a lane root deterministically (walk up to the
-  # nearest .wt-lane). Durable scratch/work product belongs in the lane, not /tmp.
-  append_lane_entry ".wt-lane" || return 1
-  printf '%s\n' "$feature" >"$feat_dir/.wt-lane"
-
-  generate_lane_guide "$feature" "$feat_dir" "${created[@]+"${created[@]}"}"
   generate_workspace_file "$feature" "$feat_dir"
-
-  append_lane_entry ".wt-lane-manifest" || return 1
-  write_lane_manifest
 
   echo
   local workspace_file
@@ -618,9 +496,10 @@ cmd_create() {
   fi
 }
 
-# remove a lane's worktrees and branches, then generated lane files
+# remove a lane's worktrees, merged branches and the files wt placed, after
+# confirming any uncommitted or edited work that would go with them
 cmd_cleanup() {
-  local feature="${1:?usage: wt [--force] cleanup <feature>}"
+  local feature="${1:?usage: wt cleanup <feature>}"
   init_workspace || return 1
 
   local feat_dir
@@ -631,13 +510,16 @@ cmd_cleanup() {
     return 1
   fi
 
-  if [ -f "$feat_dir/.wt-lane" ]; then
-    local stored
-    stored=$(cat "$feat_dir/.wt-lane" 2>/dev/null) || stored=""
-    if [ "$stored" != "$feature" ]; then
-      echo "error: lane at $feat_dir belongs to '$stored', not '$feature'" >&2
-      return 1
-    fi
+  # without a marker this may be a parent of other lanes, not a lane
+  if [ ! -f "$feat_dir/.wt-lane" ]; then
+    echo "error: $feat_dir is not a lane (no .wt-lane)" >&2
+    return 1
+  fi
+  local stored
+  stored=$(cat "$feat_dir/.wt-lane" 2>/dev/null) || stored=""
+  if [ "$stored" != "$feature" ]; then
+    echo "error: lane at $feat_dir belongs to '$stored', not '$feature'" >&2
+    return 1
   fi
 
   # discover repos from the lane itself, not the current REPOS config
@@ -654,8 +536,8 @@ cmd_cleanup() {
     fi
   done < <(find "$feat_dir" -mindepth 2 -maxdepth 2 -name .git -type f -print0)
 
-  # preflight: verify linkage and cleanliness before removing anything
-  local failed=() dirty=()
+  # preflight: verify linkage and collect work that exists nowhere else
+  local failed=() risks=() line
   if [ ${#discovered[@]} -gt 0 ]; then
     for repo in "${discovered[@]+"${discovered[@]}"}"; do
       local main="$WORKSPACE_ROOT/$repo"
@@ -680,15 +562,24 @@ cmd_cleanup() {
       fi
 
       local status
-      status=$(git -C "$target" status --porcelain 2>/dev/null) || {
+      status=$(git -C "$target" status --porcelain --untracked-files=all 2>/dev/null) || {
         echo "error: cannot inspect lane worktree: $target" >&2
         failed+=("$repo")
         continue
       }
 
-      if [ -n "$status" ]; then
-        dirty+=("$repo")
-      fi
+      while IFS= read -r line; do
+        # untracked template copies are checked against their template below
+        if [ -z "$line" ] ||
+          { [ "${line:0:2}" = "??" ] && [ -f "$REPO_TMPL/$repo/${line:3}" ]; }; then
+          continue
+        fi
+        risks+=("$repo/${line:3} (uncommitted)")
+      done <<<"$status"
+
+      while IFS= read -r line; do
+        risks+=("${line#"$feat_dir"/} (edited template copy)")
+      done < <(changed_copies "$REPO_TMPL/$repo" "$target")
     done
   fi
 
@@ -697,12 +588,37 @@ cmd_cleanup() {
     return 1
   fi
 
-  if [ ${#dirty[@]} -gt 0 ]; then
-    echo "error: lane worktrees contain uncommitted changes; no worktrees were removed" >&2
-    for repo in "${dirty[@]+"${dirty[@]}"}"; do
-      echo "  $repo" >&2
-    done
-    return 1
+  local ws_file
+  ws_file="$feat_dir/$(basename "$feature").code-workspace"
+  if [ -f "$ws_file" ] && ! workspace_file_body "$feature" | cmp -s - "$ws_file"; then
+    risks+=("${ws_file#"$feat_dir"/} (edited)")
+  fi
+  while IFS= read -r line; do
+    risks+=("${line#"$feat_dir"/} (edited template copy)")
+  done < <(changed_copies "$LANE_TMPL" "$feat_dir")
+  while IFS= read -r line; do
+    risks+=("${line#"$feat_dir"/} (added to a template copy)")
+  done < <(added_in_lane_copies "$feat_dir")
+  if [ -n "$(ls -A "$feat_dir/.idea/shelf" 2>/dev/null)" ]; then
+    risks+=(".idea/shelf (shelved IDE changes)")
+  fi
+
+  if [ ${#risks[@]} -gt 0 ]; then
+    echo "warning: cleanup would delete work that exists nowhere else:" >&2
+    printf '  %s\n' "${risks[@]}" >&2
+    if [ ! -t 0 ]; then
+      echo "error: cannot confirm without a terminal; nothing was removed" >&2
+      return 1
+    fi
+    local answer=""
+    read -r -p "Delete it anyway? [y/N] " answer || true
+    case "$answer" in
+      y | Y | yes) ;;
+      *)
+        echo "nothing was removed"
+        return 1
+        ;;
+    esac
   fi
 
   if [ ${#discovered[@]} -gt 0 ]; then
@@ -711,7 +627,8 @@ cmd_cleanup() {
       local target="$feat_dir/$repo"
 
       echo "==> $repo"
-      if git -C "$main" worktree remove "$target" &&
+      # --force: anything it would discard was listed and confirmed above
+      if git -C "$main" worktree remove --force "$target" &&
         git -C "$main" worktree prune; then
         git -C "$main" branch -d "$feature" 2>/dev/null ||
           echo "    branch $feature kept (unmerged or absent)"
@@ -727,28 +644,28 @@ cmd_cleanup() {
     return 1
   fi
 
-  load_lane_manifest "$feat_dir"
-  if lane_has_non_generated_files "$feat_dir" && [ "$FORCE" -eq 0 ]; then
-    echo "note: lane contains non-generated files; leaving lane files in place" >&2
+  # remove what wt placed in the lane root; files it did not place stay, and
+  # the markers go last so a lane that keeps files stays findable as a lane
+  local entry name kept=()
+  while IFS= read -r -d '' entry; do
+    name=${entry#"$feat_dir"/}
+    case "$name" in
+      .wt-lane | .wt-lane-manifest) continue ;; # manifest: left by older versions
+      .idea | "$(basename "$ws_file")") ;;      # .idea: IDE state, template or not
+      *) [ -e "$LANE_TMPL/$name" ] || { kept+=("$name"); continue; } ;;
+    esac
+    rm -rf -- "$entry"
+  done < <(find "$feat_dir" -mindepth 1 -maxdepth 1 -print0)
+
+  if [ ${#kept[@]} -gt 0 ]; then
+    echo "note: worktrees removed; kept lane files that wt did not create:"
+    printf '  %s\n' "${kept[@]}"
+    echo "  when done with them: rm -rf \"$feat_dir\""
     return 0
   fi
 
-  remove_generated_lane_entries "$feat_dir"
-
-  # remove lane dir and any now-empty parents up to .worktrees
-  if rmdir -- "$feat_dir" 2>/dev/null; then
-    local parent
-    parent=$(dirname "$feat_dir")
-    while [ "$parent" != "$WT_DIR" ]; do
-      if rmdir -- "$parent" 2>/dev/null; then
-        parent=$(dirname "$parent")
-      else
-        break
-      fi
-    done
-  else
-    echo "note: $feat_dir not empty, left in place"
-  fi
+  rm -f -- "$feat_dir/.wt-lane" "$feat_dir/.wt-lane-manifest"
+  remove_lane_dir "$feat_dir" || echo "note: $feat_dir not empty, left in place"
 }
 
 # print every lane's repos with branch, dirty count, origin delta
@@ -762,12 +679,10 @@ cmd_list() {
 
   # lanes are found by their .wt-lane marker, at any nesting depth
   local found=0
-  while IFS= read -r -d '' marker; do
-    local lane_dir
-    lane_dir=$(dirname "$marker")
+  while IFS= read -r -d '' lane_dir; do
     local actual="${lane_dir#"$WT_DIR"/}"
     local stored
-    stored=$(cat "$marker" 2>/dev/null) || continue
+    stored=$(cat "$lane_dir/.wt-lane" 2>/dev/null) || continue
     if [ "$stored" != "$actual" ] || ! validate_feature_name "$stored" >/dev/null 2>&1; then
       continue
     fi
@@ -794,7 +709,7 @@ cmd_list() {
       printf '%-30s %-15s %-25s %3s dirty  %s\n' \
         "$stored" "$repo" "$branch" "$dirty" "$ahead_behind"
     done < <(find "$lane_dir" -mindepth 2 -maxdepth 2 -name .git -type f -print0)
-  done < <(find "$WT_DIR" -mindepth 2 -type f -name .wt-lane -print0)
+  done < <(find_lanes "$WT_DIR")
 
   if [ "$found" -eq 0 ]; then
     echo "no lanes"

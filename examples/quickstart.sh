@@ -24,20 +24,16 @@ for repo in checkout-api checkout-web shared-events; do
 done
 
 # Example configuration: pinned repo list, default base, templates.
-cp "$EXAMPLE/.wt-workspace" .
-cp -r "$EXAMPLE/.wt-templates" .
-cp "$EXAMPLE/checkout-api/.wt-include" checkout-api/
+cp -r "$EXAMPLE/.wt" .
 
-# Local, Git-ignored config referenced by checkout-api/.wt-include.
-# The .gitignore is committed so it also applies inside lane worktrees; the
-# files themselves stay untracked and are carried into lanes by .wt-include.
-mkdir -p checkout-api/config
-printf 'export API_TOKEN=local-dev\n' >checkout-api/.envrc
-printf 'featureFlags:\n  giftCards: true\n' >checkout-api/config/local.yaml
-printf '.envrc\nconfig/local.yaml\n' >checkout-api/.gitignore
-git -C checkout-api add .gitignore
-git -C checkout-api -c user.name=wt-demo -c user.email=wt-demo@example.com \
-  -c commit.gpgsign=false commit -q -m "ignore local config"
+# Template files are Git-ignored so they do not show up as changes in lane
+# worktrees.
+for repo in checkout-api checkout-web; do
+  printf '.envrc\n.vscode/\n' >"$repo/.gitignore"
+  git -C "$repo" add .gitignore
+  git -C "$repo" -c user.name=wt-demo -c user.email=wt-demo@example.com \
+    -c commit.gpgsign=false commit -q -m "ignore local editor and env files"
+done
 
 # Lane names double as branch names, so hierarchy works: related lanes group
 # under .worktrees/<prefix>/, and each repo subset gets its own leaf.
@@ -73,10 +69,9 @@ Demo workspace left in place for inspection:
   $WS
 
 Things to look at:
-  cat "$LANE/AGENTS.md"                        # generated lane guide
-  cat "$LANE/HANDOVER.md"                      # from .wt-templates/_lane
-  cat "$LANE/checkout-api/config/local.yaml"   # copied via .wt-include
-  cat "$LANE/checkout-api/.envrc"              # live include wins over template
+  cat "$LANE/AGENTS.md"                        # lane guide, from .wt/lane_root
+  cat "$LANE/HANDOVER.md"                      # from .wt/lane_root
+  cat "$LANE/checkout-api/.envrc"              # from .wt/repos/checkout-api
   ls "$LANE"                                   # gift-card-checkout.code-workspace
 
 Branch names mirror the lane names in every repository:

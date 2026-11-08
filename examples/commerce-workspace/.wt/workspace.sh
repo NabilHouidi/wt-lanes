@@ -7,6 +7,3 @@ REPOS=(checkout-api checkout-web shared-events)
 
 # Base branch for new feature branches. Unset to use each repo's origin/HEAD.
 DEFAULT_BASE=origin/main
-
-# Rename the generated lane guide, or set it empty to disable generation.
-# LANE_GUIDE=CLAUDE.md
